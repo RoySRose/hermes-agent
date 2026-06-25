@@ -1201,6 +1201,51 @@ class TestBangPrefixCommands:
         assert msg_event.message_type == MessageType.COMMAND
 
 
+class TestFreeResponseBotMessages:
+    def _make_bot_event(self, *, channel="C_VOC", bot_user_id="U_SERVICE", text="<!subteam^S09AKCDF1DF> Room ID: *93* 환불해주세요"):
+        return {
+            "text": text,
+            "bot_id": "B_SERVICE",
+            "subtype": "bot_message",
+            "bot_profile": {"user_id": bot_user_id, "name": "re"},
+            "channel": channel,
+            "channel_type": "channel",
+            "team": "T_TEAM",
+            "ts": "1234567890.000099",
+        }
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_can_accept_service_bot_message(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+        adapter.config.extra["free_response_allow_bot_messages"] = True
+
+        await adapter._handle_slack_message(self._make_bot_event())
+
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text.startswith("<!subteam^S09AKCDF1DF>")
+        assert msg_event.source.chat_id == "C_VOC"
+        assert msg_event.source.thread_id == "1234567890.000099"
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_still_ignores_own_bot_message(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+        adapter.config.extra["free_response_allow_bot_messages"] = True
+
+        await adapter._handle_slack_message(self._make_bot_event(bot_user_id="U_BOT"))
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_service_bot_message_blocked_without_free_response_exception(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+        adapter.config.extra["free_response_allow_bot_messages"] = False
+
+        await adapter._handle_slack_message(self._make_bot_event())
+
+        adapter.handle_message.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TestIncomingDocumentHandling
 # ---------------------------------------------------------------------------

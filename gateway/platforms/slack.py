@@ -2265,21 +2265,41 @@ class SlackAdapter(BasePlatformAdapter):
         #   "mentions" — accept bot messages only when they @mention us
         #   "all"      — accept all bot messages (except our own)
         if event.get("bot_id") or event.get("subtype") == "bot_message":
+            # Always ignore our own bot messages to prevent echo loops. Slack
+            # bot_message events may omit `user`, but bot_profile.user_id is the
+            # bot user's stable ID in those payloads.
+            bot_profile = event.get("bot_profile") or {}
+            msg_user = event.get("user", "") or bot_profile.get("user_id", "")
+            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+                return
+
             allow_bots = self.config.extra.get("allow_bots", "")
             if not allow_bots:
                 allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
             allow_bots = str(allow_bots).lower().strip()
-            if allow_bots == "none":
+            channel_id_for_bot_policy = event.get("channel", "")
+            configured_allow_free_response_bots = self.config.extra.get(
+                "free_response_allow_bot_messages",
+                os.getenv("SLACK_FREE_RESPONSE_ALLOW_BOT_MESSAGES", "false"),
+            )
+            if isinstance(configured_allow_free_response_bots, str):
+                allow_free_response_bot_messages = (
+                    configured_allow_free_response_bots.lower().strip()
+                    in {"true", "1", "yes", "on"}
+                )
+            else:
+                allow_free_response_bot_messages = bool(configured_allow_free_response_bots)
+            is_free_response_bot_message = (
+                allow_free_response_bot_messages
+                and channel_id_for_bot_policy in self._slack_free_response_channels()
+            )
+            if allow_bots == "none" and not is_free_response_bot_message:
                 return
-            elif allow_bots == "mentions":
+            elif allow_bots == "mentions" and not is_free_response_bot_message:
                 text_check = event.get("text", "")
                 if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
                     return
-            # "all" falls through to process the message
-            # Always ignore our own messages to prevent echo loops
-            msg_user = event.get("user", "")
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
-                return
+            # "all" or free-response bot-message exception falls through.
 
         # Ignore message edits and deletions
         subtype = event.get("subtype")
