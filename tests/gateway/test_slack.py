@@ -1246,6 +1246,59 @@ class TestFreeResponseBotMessages:
         adapter.handle_message.assert_not_called()
 
 
+class TestFreeResponseThreadMentions:
+    def _make_thread_event(self, text, *, channel="C_VOC"):
+        return {
+            "text": text,
+            "user": "U_USER",
+            "channel": channel,
+            "channel_type": "channel",
+            "team": "T_TEAM",
+            "ts": "1234567890.000100",
+            "thread_ts": "1234567890.000099",
+        }
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_reply_to_other_user_is_ignored(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<@U0AFP216XJ5> 이건 반장에게 물어본 거야")
+        )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_reply_to_usergroup_is_ignored(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<!subteam^S09AKCDF1DF> 운영팀에서 확인 부탁")
+        )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_unaddressed_followup_still_processes(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("환불 가능한지 확인해보고 어떻게 처리할 건지 말해줘")
+        )
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_direct_bot_mention_still_processes(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<@U_BOT> 이건 오시가 확인해줘")
+        )
+
+        adapter.handle_message.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # TestIncomingDocumentHandling
 # ---------------------------------------------------------------------------

@@ -2517,7 +2517,28 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             if channel_id in self._slack_free_response_channels():
-                pass  # Free-response channel — always process
+                # Free-response channels auto-ingest top-level messages, but
+                # thread replies may pivot to another human/bot. If the user
+                # explicitly mentions someone else (and not this bot), do not
+                # hijack that conversation just because the thread has an
+                # active Hermes session. This is especially important for VOC
+                # lanes where OSI first triages, then operators may hand the
+                # thread to another teammate/bot.
+                if is_thread_reply and not is_mentioned:
+                    mentioned_users = set(re.findall(r"<@([A-Z0-9]+)>", routing_text))
+                    if bot_uid:
+                        mentioned_users.discard(bot_uid)
+                    mentioned_usergroups = set(re.findall(r"<!subteam\^([A-Z0-9]+)", routing_text))
+                    if mentioned_users or mentioned_usergroups:
+                        logger.debug(
+                            "[Slack] Ignoring free-response thread reply in %s "
+                            "addressed to other mention(s): users=%s usergroups=%s",
+                            channel_id,
+                            sorted(mentioned_users),
+                            sorted(mentioned_usergroups),
+                        )
+                        return
+                pass  # Free-response channel — process top-level or unaddressed follow-up
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
