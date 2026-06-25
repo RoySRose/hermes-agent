@@ -1269,6 +1269,16 @@ class TestFreeResponseThreadMentions:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_free_response_thread_reply_to_other_user_with_osi_text_is_ignored(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<@U0AFP216XJ5> 오시한테 가르쳐 주게")
+        )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_free_response_thread_reply_to_usergroup_is_ignored(self, adapter):
         adapter.config.extra["free_response_channels"] = "C_VOC"
 
@@ -1279,13 +1289,52 @@ class TestFreeResponseThreadMentions:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_free_response_thread_unaddressed_followup_still_processes(self, adapter):
+    async def test_free_response_thread_unaddressed_followup_processes_after_our_reply(self, adapter):
         adapter.config.extra["free_response_channels"] = "C_VOC"
 
-        await adapter._handle_slack_message(
-            self._make_thread_event("환불 가능한지 확인해보고 어떻게 처리할 건지 말해줘")
-        )
+        with patch.object(
+            adapter,
+            "_free_response_thread_previous_message_is_ours",
+            new_callable=AsyncMock,
+        ) as previous_is_ours:
+            previous_is_ours.return_value = True
+            await adapter._handle_slack_message(
+                self._make_thread_event("환불 가능한지 확인해보고 어떻게 처리할 건지 말해줘")
+            )
 
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_unaddressed_followup_ignored_after_handoff(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        with patch.object(
+            adapter,
+            "_free_response_thread_previous_message_is_ours",
+            new_callable=AsyncMock,
+        ) as previous_is_ours:
+            previous_is_ours.return_value = False
+            await adapter._handle_slack_message(
+                self._make_thread_event("어 너가 바로 줄 수 있는것만 줘봐")
+            )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_plain_osi_address_still_processes(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        with patch.object(
+            adapter,
+            "_free_response_thread_previous_message_is_ours",
+            new_callable=AsyncMock,
+        ) as previous_is_ours:
+            previous_is_ours.return_value = False
+            await adapter._handle_slack_message(
+                self._make_thread_event("오시한테는 이 지침을 반영하면 돼")
+            )
+
+        previous_is_ours.assert_not_called()
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
