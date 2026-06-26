@@ -2585,6 +2585,17 @@ class SlackAdapter(BasePlatformAdapter):
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not directly_addressed:
+                if is_thread_reply and (
+                    mentioned_users_for_name or mentioned_usergroups_for_name
+                ):
+                    logger.debug(
+                        "[Slack] Ignoring thread reply in %s addressed to other "
+                        "mention(s): users=%s usergroups=%s",
+                        channel_id,
+                        sorted(mentioned_users_for_name),
+                        sorted(mentioned_usergroups_for_name),
+                    )
+                    return
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
                 )
