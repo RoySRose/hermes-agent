@@ -2297,7 +2297,20 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             elif allow_bots == "mentions" and not is_free_response_bot_message:
                 text_check = event.get("text", "")
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                mentioned_users = set(re.findall(r"<@([A-Z0-9]+)>", text_check))
+                if self._bot_user_id:
+                    mentioned_users.discard(self._bot_user_id)
+                mentioned_usergroups = set(re.findall(r"<!subteam\^([A-Z0-9]+)", text_check))
+                name_addressed = (
+                    not mentioned_users
+                    and not mentioned_usergroups
+                    and self._slack_text_addresses_bot_by_name(text_check)
+                )
+                if (
+                    self._bot_user_id
+                    and f"<@{self._bot_user_id}>" not in text_check
+                    and not name_addressed
+                ):
                     return
             # "all" or free-response bot-message exception falls through.
 
@@ -2504,6 +2517,16 @@ class SlackAdapter(BasePlatformAdapter):
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
         is_mentioned = bool(bot_uid and f"<@{bot_uid}>" in routing_text)
+        mentioned_users_for_name = set(re.findall(r"<@([A-Z0-9]+)>", routing_text))
+        if bot_uid:
+            mentioned_users_for_name.discard(bot_uid)
+        mentioned_usergroups_for_name = set(re.findall(r"<!subteam\^([A-Z0-9]+)", routing_text))
+        name_addressed = (
+            not mentioned_users_for_name
+            and not mentioned_usergroups_for_name
+            and self._slack_text_addresses_bot_by_name(routing_text)
+        )
+        directly_addressed = is_mentioned or name_addressed
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -2561,7 +2584,7 @@ class SlackAdapter(BasePlatformAdapter):
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
-            elif not is_mentioned:
+            elif not directly_addressed:
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
                 )

@@ -1934,6 +1934,64 @@ class TestMessageRouting:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_channel_plain_osi_address_processes(self, adapter):
+        """Plain Korean bot-name calls should count as direct Slack channel addresses."""
+        event = {
+            "text": "오시야 이거 확인해줘",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_channel_other_user_mention_with_osi_text_is_ignored(self, adapter):
+        """Handoffs to another mention should not be stolen by plain OSI text."""
+        event = {
+            "text": "<@U0AFP216XJ5> 오시한테 접근법 알려줘",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_channel_bot_plain_osi_address_processes_when_bot_mentions_allowed(self, adapter):
+        """Bot messages that plainly address OSI should pass allow_bots=mentions."""
+        adapter.config.extra["allow_bots"] = "mentions"
+        event = {
+            "text": "오시, 지금 CRM MCP smoke test 해봐",
+            "bot_id": "B_OTHER",
+            "user": "U0AFP216XJB",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+            "thread_ts": "1234567890.000000",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_channel_bot_other_mention_with_osi_text_is_ignored(self, adapter):
+        """A bot handoff to another Slack mention should stay with that mention."""
+        adapter.config.extra["allow_bots"] = "mentions"
+        event = {
+            "text": "<@U0AFP216XJ5> 오시한테 접근법 알려줘",
+            "bot_id": "B_OTHER",
+            "user": "U0AFP216XJB",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+            "thread_ts": "1234567890.000000",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_channel_mention_strips_bot_id(self, adapter):
         """When mentioned in a channel, the bot mention should be stripped."""
         event = {
