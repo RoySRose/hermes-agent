@@ -1947,6 +1947,28 @@ class TestMessageRouting:
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "오시한테 시키는건가요?",
+            "오시 아님",
+            "오시는 안불렀는데 왜 기어나와",
+            "오시에게 맡긴 건 아닙니다",
+        ],
+    )
+    async def test_channel_third_person_osi_reference_is_ignored(self, adapter, text):
+        """Talking about OSI should not be treated as calling OSI."""
+        event = {
+            "text": text,
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": f"1234567890.{abs(hash(text)) % 1000000:06d}",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_channel_other_user_mention_with_osi_text_is_ignored(self, adapter):
         """Handoffs to another mention should not be stolen by plain OSI text."""
         event = {

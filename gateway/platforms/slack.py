@@ -3862,14 +3862,37 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_text_addresses_bot_by_name(self, text: str) -> bool:
         """Return True when text plainly addresses this bot by its public name.
 
-        Slack gateway routing normally relies on `<@U...>` mentions, but some
-        operational bots/users refer to OSI in Korean text ("오시한테",
-        "오시야") instead of emitting a Slack mention. Treat that as a direct
-        address only when no other Slack mention/usergroup is present at the
-        call site, so handoffs like `<@반장> 오시한테 가르쳐줘` stay with 반장.
+        Slack gateway routing normally relies on `<@U...>` mentions, but Waka
+        operators also call OSI by name in Korean text (for example, "오시야"
+        or "오시, ...").  Do not treat third-person references like
+        "오시한테 시키는 건가요?", "오시는 안 불렀는데", or "오시 아님" as
+        a wake word; those are conversation about OSI, not a request to OSI.
         """
-        normalized = str(text or "").casefold()
-        return bool(re.search(r"(?<![a-z0-9_])(?:오시|osi)(?![a-z0-9_])", normalized))
+        normalized = str(text or "").casefold().strip()
+        if not normalized:
+            return False
+
+        # Obvious negative/third-person references that should never wake the
+        # bot.  This avoids gateway-level interrupt notices before the model has
+        # a chance to decide to stay silent.
+        if re.search(
+            r"오시\s*(?:아님|아니|안\s*불렀|부른\s*거\s*아님|한테|에게|가|는|를|도|만|의)",
+            normalized,
+        ):
+            return False
+
+        # English name: normal word boundaries are enough.
+        if re.search(r"(?<![a-z0-9_])osi(?![a-z0-9_])", normalized):
+            return True
+
+        # Korean direct calls.  Accept vocative forms and bare "오시" followed
+        # by a separator, but reject particles by the negative guard above.
+        return bool(
+            re.search(
+                r"(?:^|[\s,.;:!?~>\n])오시(?:야|님)?(?:$|[\s,.;:!?~\n])",
+                normalized,
+            )
+        )
 
     async def _free_response_thread_previous_message_is_ours(
         self,
