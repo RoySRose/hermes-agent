@@ -2598,21 +2598,54 @@ class SlackAdapter(BasePlatformAdapter):
         #   "mentions" — accept bot messages only when they @mention us
         #   "all"      — accept all bot messages (except our own)
         if event.get("bot_id") or event.get("subtype") == "bot_message":
+            # Always ignore our own bot messages to prevent echo loops. Slack
+            # bot_message events may omit `user`, but bot_profile.user_id is the
+            # bot user's stable ID in those payloads.
+            bot_profile = event.get("bot_profile") or {}
+            msg_user = event.get("user", "") or bot_profile.get("user_id", "")
+            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+                return
+
             allow_bots = self.config.extra.get("allow_bots", "")
             if not allow_bots:
                 allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
             allow_bots = str(allow_bots).lower().strip()
-            if allow_bots == "none":
+            channel_id_for_bot_policy = event.get("channel", "")
+            configured_allow_free_response_bots = self.config.extra.get(
+                "free_response_allow_bot_messages",
+                os.getenv("SLACK_FREE_RESPONSE_ALLOW_BOT_MESSAGES", "false"),
+            )
+            if isinstance(configured_allow_free_response_bots, str):
+                allow_free_response_bot_messages = (
+                    configured_allow_free_response_bots.lower().strip()
+                    in {"true", "1", "yes", "on"}
+                )
+            else:
+                allow_free_response_bot_messages = bool(configured_allow_free_response_bots)
+            is_free_response_bot_message = (
+                allow_free_response_bot_messages
+                and channel_id_for_bot_policy in self._slack_free_response_channels()
+            )
+            if allow_bots == "none" and not is_free_response_bot_message:
                 return
-            elif allow_bots == "mentions":
+            elif allow_bots == "mentions" and not is_free_response_bot_message:
                 text_check = event.get("text", "")
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                mentioned_users = set(re.findall(r"<@([A-Z0-9]+)>", text_check))
+                if self._bot_user_id:
+                    mentioned_users.discard(self._bot_user_id)
+                mentioned_usergroups = set(re.findall(r"<!subteam\^([A-Z0-9]+)", text_check))
+                name_addressed = (
+                    not mentioned_users
+                    and not mentioned_usergroups
+                    and self._slack_text_addresses_bot_by_name(text_check)
+                )
+                if (
+                    self._bot_user_id
+                    and f"<@{self._bot_user_id}>" not in text_check
+                    and not name_addressed
+                ):
                     return
-            # "all" falls through to process the message
-            # Always ignore our own messages to prevent echo loops
-            msg_user = event.get("user", "")
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
-                return
+            # "all" or free-response bot-message exception falls through.
 
         # Ignore message edits and deletions
         subtype = event.get("subtype")
@@ -2820,6 +2853,16 @@ class SlackAdapter(BasePlatformAdapter):
             (bot_uid and f"<@{bot_uid}>" in routing_text)
             or self._slack_message_matches_mention_patterns(routing_text)
         )
+        mentioned_users_for_name = set(re.findall(r"<@([A-Z0-9]+)>", routing_text))
+        if bot_uid:
+            mentioned_users_for_name.discard(bot_uid)
+        mentioned_usergroups_for_name = set(re.findall(r"<!subteam\^([A-Z0-9]+)", routing_text))
+        name_addressed = (
+            not mentioned_users_for_name
+            and not mentioned_usergroups_for_name
+            and self._slack_text_addresses_bot_by_name(routing_text)
+        )
+        directly_addressed = is_mentioned or name_addressed
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -2833,12 +2876,52 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             if channel_id in self._slack_free_response_channels():
-                pass  # Free-response channel — always process
+                # Free-response channels auto-ingest top-level messages, but
+                # thread replies may pivot to another human/bot. For thread
+                # replies, process only when (a) this bot is directly
+                # addressed, or (b) the user is continuing from our immediately
+                # previous reply. This lets VOC triage continue naturally while
+                # preventing OSI from hijacking handoffs to 반장/@re/@운영.
+                if is_thread_reply:
+                    if not directly_addressed:
+                        if mentioned_users_for_name or mentioned_usergroups_for_name:
+                            logger.debug(
+                                "[Slack] Ignoring free-response thread reply in %s "
+                                "addressed to other mention(s): users=%s usergroups=%s",
+                                channel_id,
+                                sorted(mentioned_users_for_name),
+                                sorted(mentioned_usergroups_for_name),
+                            )
+                            return
+                        if not await self._free_response_thread_previous_message_is_ours(
+                            channel_id=channel_id,
+                            thread_ts=str(event_thread_ts or ""),
+                            current_ts=ts,
+                            team_id=team_id,
+                        ):
+                            logger.debug(
+                                "[Slack] Ignoring unaddressed free-response thread reply "
+                                "in %s because previous message was not ours",
+                                channel_id,
+                            )
+                            return
+                pass  # Free-response channel — process top-level or eligible follow-up
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
-            elif not is_mentioned:
+            elif not directly_addressed:
+                if is_thread_reply and (
+                    mentioned_users_for_name or mentioned_usergroups_for_name
+                ):
+                    logger.debug(
+                        "[Slack] Ignoring thread reply in %s addressed to other "
+                        "mention(s): users=%s usergroups=%s",
+                        channel_id,
+                        sorted(mentioned_users_for_name),
+                        sorted(mentioned_usergroups_for_name),
+                    )
+                    return
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
                 )
@@ -3783,6 +3866,10 @@ class SlackAdapter(BasePlatformAdapter):
                 if bot_uid:
                     msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
 
+                max_context_chars_per_message = 1200
+                if len(msg_text) > max_context_chars_per_message:
+                    msg_text = msg_text[: max_context_chars_per_message - 20].rstrip() + "... [truncated]"
+
                 prefix = "[thread parent] " if is_parent else ""
                 display_user = msg_user or "unknown"
                 # Prefer the bot's own name when the message is a bot post.
@@ -3824,9 +3911,26 @@ class SlackAdapter(BasePlatformAdapter):
                         "[Thread context — prior messages in this thread "
                         "(not yet in conversation history):]"
                     )
+                max_thread_context_chars = 9000
+                selected_parts: list[str] = []
+                total_chars = 0
+                # Keep the thread parent plus the most recent messages. Older
+                # long handoff/code-block replies can otherwise blow the model
+                # context when a bot is mentioned mid-thread after restart.
+                parent_part = context_parts[0]
+                selected_parts.append(parent_part)
+                total_chars += len(parent_part) + 1
+                for part in reversed(context_parts[1:]):
+                    part_len = len(part) + 1
+                    if selected_parts and total_chars + part_len > max_thread_context_chars:
+                        break
+                    selected_parts.insert(1, part)
+                    total_chars += part_len
+                if len(selected_parts) < len(context_parts):
+                    selected_parts.insert(1, "[... older thread context truncated ...]")
                 content = (
                     header + "\n"
-                    + "\n".join(context_parts)
+                    + "\n".join(selected_parts)
                     + "\n[End of thread context]\n\n"
                 )
 
@@ -4142,6 +4246,89 @@ class SlackAdapter(BasePlatformAdapter):
                     raise
 
     # ── Channel mention gating ─────────────────────────────────────────────
+
+    def _slack_text_addresses_bot_by_name(self, text: str) -> bool:
+        """Return True when text plainly addresses this bot by its public name.
+
+        Slack gateway routing normally relies on `<@U...>` mentions, but Waka
+        operators also call OSI by name in Korean text (for example, "오시야"
+        or "오시, ...").  Do not treat third-person references like
+        "오시한테 시키는 건가요?", "오시는 안 불렀는데", or "오시 아님" as
+        a wake word; those are conversation about OSI, not a request to OSI.
+        """
+        normalized = str(text or "").casefold().strip()
+        if not normalized:
+            return False
+
+        # Obvious negative/third-person references that should never wake the
+        # bot.  This avoids gateway-level interrupt notices before the model has
+        # a chance to decide to stay silent.
+        if re.search(
+            r"오시\s*(?:아님|아니|안\s*불렀|부른\s*거\s*아님|한테|에게|가|는|를|도|만|의)",
+            normalized,
+        ):
+            return False
+
+        # English name: normal word boundaries are enough.
+        if re.search(r"(?<![a-z0-9_])osi(?![a-z0-9_])", normalized):
+            return True
+
+        # Korean direct calls.  Accept vocative forms and bare "오시" followed
+        # by a separator, but reject particles by the negative guard above.
+        return bool(
+            re.search(
+                r"(?:^|[\s,.;:!?~>\n])오시(?:야|님)?(?:$|[\s,.;:!?~\n])",
+                normalized,
+            )
+        )
+
+    async def _free_response_thread_previous_message_is_ours(
+        self,
+        *,
+        channel_id: str,
+        thread_ts: str,
+        current_ts: str,
+        team_id: str = "",
+    ) -> bool:
+        """Return whether the immediate prior thread message was sent by us.
+
+        Free-response channels should not let the bot answer every thread
+        message forever. Unaddressed follow-ups are routed only when the user is
+        continuing from our latest reply (e.g. confirming an OSI proposal). If
+        the previous message was another teammate/bot, the conversation has
+        likely been handed off.
+        """
+        if not channel_id or not thread_ts or not current_ts:
+            return False
+        try:
+            result = await self._get_client(channel_id).conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                latest=current_ts,
+                inclusive=False,
+                limit=5,
+            )
+            messages = result.get("messages", []) if result else []
+            prior_messages = [
+                msg for msg in messages if msg.get("ts") and msg.get("ts") != current_ts
+            ]
+            if not prior_messages:
+                return False
+            prior_messages.sort(key=lambda msg: float(msg.get("ts", "0") or 0.0))
+            previous = prior_messages[-1]
+            previous_user = previous.get("user", "") or (previous.get("bot_profile") or {}).get("user_id", "")
+            previous_team = previous.get("team") or team_id
+            self_bot_uid = (
+                self._team_bot_user_ids.get(previous_team) if previous_team else None
+            ) or self._bot_user_id
+            return bool(previous_user and self_bot_uid and previous_user == self_bot_uid)
+        except Exception as exc:  # pragma: no cover - defensive network fallback
+            logger.debug(
+                "[Slack] Failed to inspect previous free-response thread message: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
 
     def _slack_require_mention(self) -> bool:
         """Return whether channel messages require an explicit bot mention.

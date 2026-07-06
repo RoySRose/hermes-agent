@@ -1200,6 +1200,174 @@ class TestBangPrefixCommands:
         assert msg_event.text.startswith("/queue")
         assert msg_event.message_type == MessageType.COMMAND
 
+class TestFreeResponseBotMessages:
+    def _make_bot_event(self, *, channel="C_VOC", bot_user_id="U_SERVICE", text="<!subteam^S09AKCDF1DF> Room ID: *93* 환불해주세요"):
+        return {
+            "text": text,
+            "bot_id": "B_SERVICE",
+            "subtype": "bot_message",
+            "bot_profile": {"user_id": bot_user_id, "name": "re"},
+            "channel": channel,
+            "channel_type": "channel",
+            "team": "T_TEAM",
+            "ts": "1234567890.000099",
+        }
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_can_accept_service_bot_message(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+        adapter.config.extra["free_response_allow_bot_messages"] = True
+
+        await adapter._handle_slack_message(self._make_bot_event())
+
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text.startswith("<!subteam^S09AKCDF1DF>")
+        assert msg_event.source.chat_id == "C_VOC"
+        assert msg_event.source.thread_id == "1234567890.000099"
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_still_ignores_own_bot_message(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+        adapter.config.extra["free_response_allow_bot_messages"] = True
+
+        await adapter._handle_slack_message(self._make_bot_event(bot_user_id="U_BOT"))
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_service_bot_message_blocked_without_free_response_exception(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+        adapter.config.extra["free_response_allow_bot_messages"] = False
+
+        await adapter._handle_slack_message(self._make_bot_event())
+
+        adapter.handle_message.assert_not_called()
+
+
+class TestFreeResponseThreadMentions:
+    def _make_thread_event(self, text, *, channel="C_VOC"):
+        return {
+            "text": text,
+            "user": "U_USER",
+            "channel": channel,
+            "channel_type": "channel",
+            "team": "T_TEAM",
+            "ts": "1234567890.000100",
+            "thread_ts": "1234567890.000099",
+        }
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_reply_to_other_user_is_ignored(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<@U0AFP216XJ5> 이건 반장에게 물어본 거야")
+        )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_reply_to_other_user_with_osi_text_is_ignored(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<@U0AFP216XJ5> 오시한테 가르쳐 주게")
+        )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_reply_to_usergroup_is_ignored(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<!subteam^S09AKCDF1DF> 운영팀에서 확인 부탁")
+        )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_unaddressed_followup_processes_after_our_reply(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        with patch.object(
+            adapter,
+            "_free_response_thread_previous_message_is_ours",
+            new_callable=AsyncMock,
+        ) as previous_is_ours:
+            previous_is_ours.return_value = True
+            await adapter._handle_slack_message(
+                self._make_thread_event("환불 가능한지 확인해보고 어떻게 처리할 건지 말해줘")
+            )
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_unaddressed_followup_ignored_after_handoff(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        with patch.object(
+            adapter,
+            "_free_response_thread_previous_message_is_ours",
+            new_callable=AsyncMock,
+        ) as previous_is_ours:
+            previous_is_ours.return_value = False
+            await adapter._handle_slack_message(
+                self._make_thread_event("어 너가 바로 줄 수 있는것만 줘봐")
+            )
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_plain_osi_address_still_processes(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        with patch.object(
+            adapter,
+            "_free_response_thread_previous_message_is_ours",
+            new_callable=AsyncMock,
+        ) as previous_is_ours:
+            previous_is_ours.return_value = False
+            await adapter._handle_slack_message(
+                self._make_thread_event("오시야 이 지침 반영해줘")
+            )
+
+        previous_is_ours.assert_not_called()
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_third_person_osi_uses_previous_check(self, adapter):
+        """'오시한테 ...' is third-person talk about OSI, not a direct call —
+        tightened wake word must route it through the previous-message check."""
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        with patch.object(
+            adapter,
+            "_free_response_thread_previous_message_is_ours",
+            new_callable=AsyncMock,
+        ) as previous_is_ours:
+            previous_is_ours.return_value = False
+            await adapter._handle_slack_message(
+                self._make_thread_event("오시한테는 이 지침을 반영하면 돼")
+            )
+
+        previous_is_ours.assert_called_once()
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_response_thread_direct_bot_mention_still_processes(self, adapter):
+        adapter.config.extra["free_response_channels"] = "C_VOC"
+
+        await adapter._handle_slack_message(
+            self._make_thread_event("<@U_BOT> 이건 오시가 확인해줘")
+        )
+
+        adapter.handle_message.assert_called_once()
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # TestIncomingDocumentHandling
@@ -2014,6 +2182,87 @@ class TestMessageRouting:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_channel_plain_osi_address_processes(self, adapter):
+        """Plain Korean bot-name calls should count as direct Slack channel addresses."""
+        event = {
+            "text": "오시야 이거 확인해줘",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "오시한테 시키는건가요?",
+            "오시 아님",
+            "오시는 안불렀는데 왜 기어나와",
+            "오시에게 맡긴 건 아닙니다",
+        ],
+    )
+    async def test_channel_third_person_osi_reference_is_ignored(self, adapter, text):
+        """Talking about OSI should not be treated as calling OSI."""
+        event = {
+            "text": text,
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": f"1234567890.{abs(hash(text)) % 1000000:06d}",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_channel_other_user_mention_with_osi_text_is_ignored(self, adapter):
+        """Handoffs to another mention should not be stolen by plain OSI text."""
+        event = {
+            "text": "<@U0AFP216XJ5> 오시한테 접근법 알려줘",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_channel_bot_plain_osi_address_processes_when_bot_mentions_allowed(self, adapter):
+        """Bot messages that plainly address OSI should pass allow_bots=mentions."""
+        adapter.config.extra["allow_bots"] = "mentions"
+        event = {
+            "text": "오시, 지금 CRM MCP smoke test 해봐",
+            "bot_id": "B_OTHER",
+            "user": "U0AFP216XJB",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+            "thread_ts": "1234567890.000000",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_channel_bot_other_mention_with_osi_text_is_ignored(self, adapter):
+        """A bot handoff to another Slack mention should stay with that mention."""
+        adapter.config.extra["allow_bots"] = "mentions"
+        event = {
+            "text": "<@U0AFP216XJ5> 오시한테 접근법 알려줘",
+            "bot_id": "B_OTHER",
+            "user": "U0AFP216XJB",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+            "thread_ts": "1234567890.000000",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
 
 
 # ---------------------------------------------------------------------------
@@ -2906,6 +3155,72 @@ class TestThreadReplyHandling:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_with_other_user_mention_ignored_even_with_session(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Active thread sessions must not hijack handoffs to another mention."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "비상에서 4K를 올린건가요? <@U0AFP216XJ5>",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_with_usergroup_mention_ignored_even_with_session(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Active thread sessions must not answer messages addressed to a user group."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "<!subteam^S09AKCDF1DF> 참고해주세요",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_with_bot_and_other_mention_still_processes(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """If OSI is explicitly mentioned, extra copied users do not block routing."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "<@U_BOT> <@U0AFP216XJ5> 이건 오시가 확인해줘",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert msg_event.text == "<@U0AFP216XJ5> 이건 오시가 확인해줘"
+
 
 
 # ---------------------------------------------------------------------------
