@@ -14516,6 +14516,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Routing must come from the queued watch event itself, not from whatever
         foreground message happened to be active when the queue was drained.
         """
+        evt_type = evt.get("type", "")
+        if (
+            evt_type in {"watch_match", "watch_disabled"}
+            and self._load_background_notifications_mode() == "off"
+        ):
+            logger.debug(
+                "Suppressing watch notification because background notifications are off: %s",
+                evt.get("session_id", "unknown"),
+            )
+            return
+
         source = self._build_process_event_source(evt)
         if not source:
             logger.warning(
@@ -14647,9 +14658,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
 
-        if notify_mode == "off" and not agent_notify:
-            # Still wait for the process to exit so we can log it, but don't
-            # push any messages to the user.
+        if notify_mode == "off":
+            # The profile-level operator setting is authoritative, including
+            # over per-call notify_on_complete requests. Still wait for exit so
+            # lifecycle logging and watcher cleanup remain intact.
             while True:
                 await asyncio.sleep(interval)
                 session = process_registry.get(session_id)

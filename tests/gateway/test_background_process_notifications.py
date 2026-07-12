@@ -205,6 +205,58 @@ async def test_run_process_watcher_respects_notification_mode(
 
 
 @pytest.mark.asyncio
+async def test_off_mode_suppresses_notify_on_complete_injection(monkeypatch, tmp_path):
+    """Global off must silence agent-triggered completion turns too.
+
+    ``notify_on_complete=True`` asks the gateway to wake the agent after exit,
+    but the profile-level ``off`` setting is the operator's final authority
+    over user-facing background process notifications.
+    """
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="traceback\n", exited=True, exit_code=1, command="false",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "off")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = {
+        **_watcher_dict("proc_silent_completion"),
+        "session_key": "agent:main:telegram:dm:123",
+        "notify_on_complete": True,
+    }
+
+    await runner._run_process_watcher(watcher)
+
+    assert adapter.send.await_count == 0
+    assert adapter.handle_message.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evt_type", ["watch_match", "watch_disabled"])
+async def test_off_mode_suppresses_watch_pattern_injection(monkeypatch, tmp_path, evt_type):
+    """Global off also silences watch-pattern and watch-disabled events."""
+    runner = _build_runner(monkeypatch, tmp_path, "off")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    evt = {
+        "type": evt_type,
+        "session_id": "proc_silent_watch",
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_id": "123",
+    }
+
+    await runner._inject_watch_notification("[IMPORTANT: Background process matched]", evt)
+
+    assert adapter.handle_message.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
     """thread_id from watcher dict is forwarded as metadata to adapter.send()."""
     import tools.process_registry as pr_module
