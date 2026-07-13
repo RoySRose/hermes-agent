@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 from gateway.config import PlatformConfig
@@ -208,6 +209,8 @@ def test_exact_two_button_labels_and_persistent_timeout(tmp_path):
     assert approval.approval_id == approval_id
     assert view.timeout is None
     assert [child.label for child in view.children] == [CHOICE_FALSE_LABEL, CHOICE_TRUE_LABEL]
+    assert view.children[0].style == discord.ButtonStyle.success
+    assert view.children[1].style == discord.ButtonStyle.danger
     assert len(view.children) == 2
     assert all(child.custom_id.startswith("gollassul.synthetic.") for child in view.children)
 
@@ -452,8 +455,10 @@ def test_restart_pending_view_restore(tmp_path):
     adapter._restore_file_approval_view(pending_approvals(settings)[0])
 
     adapter._client.add_view.assert_called_once()
+    restored_view = adapter._client.add_view.call_args.args[0]
     assert adapter._client.add_view.call_args.kwargs["message_id"] == 987
-    assert adapter._client.add_view.call_args.args[0].timeout is None
+    assert restored_view.timeout is None
+    assert [child.style for child in restored_view.children] == [discord.ButtonStyle.success, discord.ButtonStyle.danger]
 
 
 @pytest.mark.asyncio
@@ -477,6 +482,9 @@ async def test_ui_edit_failure_repaired_without_second_decision_or_wakeup(tmp_pa
     await adapter._poll_file_approval_requests()
 
     repaired_message.edit.assert_called_once()
+    repaired_view = repaired_message.edit.call_args.kwargs["view"]
+    assert [child.style for child in repaired_view.children] == [discord.ButtonStyle.success, discord.ButtonStyle.danger]
+    assert all(child.disabled for child in repaired_view.children)
     assert _row(state_dir, "SELECT ui_state FROM approval_requests WHERE approval_id=?", (approval_id,))["ui_state"] == "ui_updated"
     assert _row(state_dir, "SELECT COUNT(*) AS c FROM approval_outbox WHERE approval_id=?", (approval_id,))["c"] == 1
 

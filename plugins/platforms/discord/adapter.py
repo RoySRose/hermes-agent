@@ -7165,7 +7165,7 @@ def _define_discord_view_classes() -> None:
 
             false_btn = discord.ui.Button(
                 label=CHOICE_FALSE_LABEL,
-                style=discord.ButtonStyle.secondary,
+                style=discord.ButtonStyle.success,
                 custom_id=approval.custom_id_false,
             )
             false_btn.callback = self._make_callback(False)
@@ -7173,7 +7173,7 @@ def _define_discord_view_classes() -> None:
 
             true_btn = discord.ui.Button(
                 label=CHOICE_TRUE_LABEL,
-                style=discord.ButtonStyle.success,
+                style=discord.ButtonStyle.danger,
                 custom_id=approval.custom_id_true,
             )
             true_btn.callback = self._make_callback(True)
