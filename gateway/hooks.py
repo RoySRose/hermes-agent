@@ -26,10 +26,10 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
                   when not in a thread / topic)
   chat_type    -- "dm" | "group" | "forum" (empty if unknown)
   session_id   -- Hermes session id
-  message      -- inbound message text (truncated to 500 chars)
+  message      -- inbound message text (full, no truncation — ecosystem patch)
 
 ``agent:end`` adds:
-  response     -- agent response text (truncated to 500 chars)
+  response     -- agent response text (full, no truncation — ecosystem patch)
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``

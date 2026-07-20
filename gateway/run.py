@@ -10887,7 +10887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "message": message_text,
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -11084,7 +11084,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
-                "response": (response or "")[:500],
+                "response": response or "",
             })
             
             # Check for pending process watchers (check_interval on background processes)
