@@ -6,6 +6,7 @@ import sys
 import time
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -261,7 +262,7 @@ def _make_runner(adapter):
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
-    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.hooks = SimpleNamespace(loaded_hooks=False, emit=AsyncMock())
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
         group_sessions_per_user=False,
@@ -745,7 +746,10 @@ async def _run_with_agent(
     chat_id="-1001",
     chat_type="group",
     thread_id="17585",
+    user_id=None,
+    event_message_id=None,
     adapter_cls=ProgressCaptureAdapter,
+    return_runner=False,
 ):
     if config_data:
         import yaml
@@ -772,6 +776,7 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        user_id=user_id,
     )
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
@@ -791,7 +796,10 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id=event_message_id,
     )
+    if return_runner:
+        return adapter, result, runner
     return adapter, result
 
 
@@ -840,6 +848,42 @@ async def test_run_agent_surfaces_real_interim_commentary(monkeypatch, tmp_path)
 
     assert result.get("already_sent") is not True
     assert any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_emits_hook_after_commentary_delivery(monkeypatch, tmp_path):
+    adapter, result, runner = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-commentary-hook",
+        config_data={"display": {"interim_assistant_messages": True}},
+        platform=Platform.DISCORD,
+        chat_id="discord-thread-42",
+        chat_type="thread",
+        thread_id="thread-42",
+        user_id="user-7",
+        event_message_id="inbound-user-message",
+        return_runner=True,
+    )
+
+    assert result.get("already_sent") is not True
+    commentary_calls = [
+        call
+        for call in runner.hooks.emit.await_args_list
+        if call.args and call.args[0] == "agent:commentary"
+    ]
+    assert len(commentary_calls) == 1
+    assert commentary_calls[0].args[1] == {
+        "platform": "discord",
+        "user_id": "user-7",
+        "chat_id": "discord-thread-42",
+        "thread_id": "thread-42",
+        "chat_type": "thread",
+        "session_id": "sess-commentary-hook",
+        "response": "I'll inspect the repo first.",
+        "event_message_id": "progress-1",
+    }
 
 
 @pytest.mark.asyncio

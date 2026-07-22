@@ -16669,6 +16669,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _loop_for_step = asyncio.get_running_loop()
         _hooks_ref = self.hooks
 
+        async def _emit_commentary_delivery_hook(
+            delivered_text: str,
+            platform_message_id: Optional[str],
+        ) -> None:
+            await _hooks_ref.emit("agent:commentary", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "chat_id": source.chat_id or "",
+                "thread_id": (
+                    str(source.thread_id) if source.thread_id else ""
+                ),
+                "chat_type": source.chat_type or "",
+                "session_id": session_id,
+                "response": delivered_text,
+                "event_message_id": (
+                    str(platform_message_id) if platform_message_id is not None else ""
+                ),
+            })
+
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
             if not _run_still_current():
                 return
@@ -16899,6 +16918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 if progress_queue is not None
                                 else None
                             ),
+                            on_commentary_delivered=_emit_commentary_delivery_hook,
                             on_before_finalize=_pause_typing_before_finalize,
                             initial_reply_to_id=event_message_id,
                             run_still_current=_run_still_current,
