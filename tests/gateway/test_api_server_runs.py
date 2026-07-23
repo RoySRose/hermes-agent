@@ -305,6 +305,83 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_events_stream_emits_completed_interim_messages(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                callback = kwargs["interim_assistant_callback"]
+                agent = MagicMock()
+                agent._strip_think_blocks.side_effect = lambda text: text.replace(
+                    "<think>private</think>", ""
+                )
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+
+                def run_conversation(**_run_kwargs):
+                    callback("<think>private</think>실제 중간 진행", already_streamed=True)
+                    callback("두 번째 진행")
+                    return {"final_response": "최종 답변"}
+
+                agent.run_conversation.side_effect = run_conversation
+                agent.session_prompt_tokens = 10
+                agent.session_completion_tokens = 5
+                agent.session_total_tokens = 15
+                return agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        interim = [event for event in events if event.get("event") == "assistant.interim.completed"]
+        assert [event["event_id"] for event in interim] == [
+            f"{run_id}:interim:0",
+            f"{run_id}:interim:1",
+        ]
+        assert [event["content"] for event in interim] == ["실제 중간 진행", "두 번째 진행"]
+        assert all(
+            not ({"reasoning", "args", "preview", "result", "output", "usage"} & event.keys())
+            for event in interim
+        )
+        assert any(event.get("event") == "run.completed" and event.get("output") == "최종 답변" for event in events)
+
+    @pytest.mark.asyncio
+    async def test_events_stream_suppresses_housekeeping_final_candidate(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                callback = kwargs["interim_assistant_callback"]
+                agent = MagicMock()
+                agent._strip_think_blocks.side_effect = lambda text: text
+                agent._last_content_with_tools = "final answer"
+                agent._last_content_tools_all_housekeeping = True
+
+                def run_conversation(**_run_kwargs):
+                    callback("final answer")
+                    return {"final_response": "final answer"}
+
+                agent.run_conversation.side_effect = run_conversation
+                agent.session_prompt_tokens = 0
+                agent.session_completion_tokens = 0
+                agent.session_total_tokens = 0
+                return agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert "assistant.interim.completed" not in body
+        assert "final answer" in body
+
 
 
     @pytest.mark.asyncio
