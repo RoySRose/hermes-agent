@@ -1749,6 +1749,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        interim_assistant_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -1866,6 +1867,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            interim_assistant_callback=interim_assistant_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -4855,7 +4857,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not conversation_history:
             _client_session_id = body.get("session_id")
             if _client_session_id:
-                conversation_history = self._conversation_history_for_session(_client_session_id)
+                conversation_history = await self._conversation_history_for_session(_client_session_id)
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
@@ -4874,6 +4876,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_approval_sessions[run_id] = approval_session_key
 
         event_cb = self._make_run_event_callback(run_id, loop)
+        interim_sequence = 0
+        agent_ref: List[Any] = [None]
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
@@ -4893,6 +4897,50 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "delta": delta,
                 })
+            except Exception:
+                pass
+
+        # [local-patch] run-interim-assistant-events
+        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            """Expose only completed, visible interim assistant messages."""
+            nonlocal interim_sequence
+            agent = agent_ref[0]
+            if agent is None:
+                return
+            try:
+                visible = agent._strip_think_blocks(text or "").strip()
+            except Exception:
+                visible = str(text or "").strip()
+            if not visible:
+                return
+
+            # A content+housekeeping-tools turn may become the final answer when
+            # its follow-up is empty. Keep that candidate exclusively in
+            # run.completed instead of leaking it as interim commentary.
+            try:
+                last_content = agent._strip_think_blocks(
+                    getattr(agent, "_last_content_with_tools", "") or ""
+                ).strip()
+            except Exception:
+                last_content = str(getattr(agent, "_last_content_with_tools", "") or "").strip()
+            if (
+                getattr(agent, "_last_content_tools_all_housekeeping", False)
+                and visible == last_content
+            ):
+                return
+
+            event_id = f"{run_id}:interim:{interim_sequence}"
+            interim_sequence += 1
+            event = {
+                "event": "assistant.interim.completed",
+                "run_id": run_id,
+                "event_id": event_id,
+                "timestamp": time.time(),
+                "content": visible,
+            }
+            self._set_run_status(run_id, "running", last_event=event["event"])
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
             except Exception:
                 pass
 
@@ -4930,10 +4978,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
+                        interim_assistant_callback=_interim_assistant_cb,
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
                     )
+                agent_ref[0] = agent
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
