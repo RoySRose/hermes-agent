@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -351,6 +352,32 @@ class TestRunEvents:
             for event in interim
         )
         assert any(event.get("event") == "run.completed" and event.get("output") == "최종 답변" for event in events)
+
+    def test_run_event_callback_exposes_only_skill_view_name(self, adapter):
+        run_id = "run_skill"
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._set_run_status(run_id, "running")
+        loop = asyncio.new_event_loop()
+        callback = adapter._make_run_event_callback(run_id, loop)
+
+        callback(
+            "tool.started",
+            "skill_view",
+            "/private/SKILL.md",
+            {"name": "contract-first-qa", "token": "secret"},
+        )
+        loop.run_until_complete(asyncio.sleep(0))
+        event = loop.run_until_complete(queue.get())
+        loop.close()
+
+        assert event["tool"] == "skill_view"
+        assert event["skill_name"] == "contract-first-qa"
+        assert event["event_id"].startswith(f"{run_id}:skill:")
+        assert "args" not in event
+        assert "preview" not in event
+        assert "secret" not in json.dumps(event)
+        assert "/private" not in json.dumps(event)
 
     @pytest.mark.asyncio
     async def test_events_stream_suppresses_housekeeping_final_candidate(self, adapter):
