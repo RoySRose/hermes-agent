@@ -4730,6 +4730,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        skill_index = 0
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -4745,15 +4747,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+            nonlocal skill_index
             ts = time.time()
             if event_type == "tool.started":
-                _push({
+                event = {
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "preview": preview,
-                })
+                }
+                if tool_name == "skill_view" and isinstance(args, dict):
+                    skill_name = args.get("name")
+                    if isinstance(skill_name, str) and skill_name:
+                        event["skill_name"] = skill_name
+                        event["event_id"] = f"{run_id}:skill:{skill_index}"
+                        skill_index += 1
+                else:
+                    event["preview"] = preview
+                _push(event)
             elif event_type == "tool.completed":
                 _push({
                     "event": "tool.completed",
