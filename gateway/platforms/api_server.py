@@ -4846,6 +4846,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        # Fall back to persisted session history when the client addresses an
+        # existing session but supplies no explicit conversation_history or
+        # response chain. Mirrors /api/sessions/{id}/chat (_handle_session_chat)
+        # so run-addressed clients (e.g. the Hub bridge, session_id="hub-<chan>")
+        # get durable multi-turn memory instead of a cold session every turn.
+        # [local-patch] run-session-history-load
+        if not conversation_history:
+            _client_session_id = body.get("session_id")
+            if _client_session_id:
+                conversation_history = self._conversation_history_for_session(_client_session_id)
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
