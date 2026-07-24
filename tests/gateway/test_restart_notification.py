@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import HomeChannel, Platform
+from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import (
@@ -610,6 +610,64 @@ async def test_send_restart_notification_skipped_when_flag_disabled(
     assert delivered_target is None
     adapter.send.assert_not_called()
     assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_discord_restart_notification_is_removed_even_when_flag_true(
+    tmp_path, monkeypatch
+):
+    """Discord can never receive a gateway restart lifecycle message."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "discord",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms = {
+        Platform.DISCORD: PlatformConfig(
+            enabled=True,
+            token="***",
+            gateway_restart_notification=True,
+        )
+    }
+    runner.adapters = {Platform.DISCORD: adapter}
+    adapter.send = AsyncMock()
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target is None
+    adapter.send.assert_not_called()
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_discord_startup_home_notification_is_removed_even_when_flag_true(
+    tmp_path, monkeypatch
+):
+    """Discord can never receive the gateway-online home-channel broadcast."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    runner.config.platforms = {
+        Platform.DISCORD: PlatformConfig(
+            enabled=True,
+            token="***",
+            home_channel=HomeChannel(
+                platform=Platform.DISCORD,
+                chat_id="home-42",
+                name="Discord Home",
+            ),
+            gateway_restart_notification=True,
+        )
+    }
+    runner.adapters = {Platform.DISCORD: adapter}
+    adapter.send = AsyncMock()
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == set()
+    adapter.send.assert_not_called()
 
 
 @pytest.mark.asyncio

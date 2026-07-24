@@ -2373,6 +2373,18 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
+
+# [local-patch] discord-lifecycle-notifications-removed
+def _gateway_lifecycle_notifications_enabled(platform: Platform) -> bool:
+    """Return whether gateway lifecycle notices may be sent on *platform*.
+
+    Discord is a conversational transport only in this deployment. Gateway
+    start/stop/restart notices belong to the operator Hub and must never be
+    emitted through a Discord adapter, regardless of profile configuration.
+    """
+    return platform is not Platform.DISCORD
+
+
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
         _INTERRUPT_REASON_STOP.lower(),
@@ -6237,6 +6249,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
+                if not _gateway_lifecycle_notifications_enabled(platform):
+                    continue
                 adapter = self.adapters.get(platform)
                 if not adapter:
                     continue
@@ -6326,6 +6340,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
+            if not _gateway_lifecycle_notifications_enabled(platform):
+                continue
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
@@ -16218,6 +16234,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             platform = Platform(platform_str)
+            if not _gateway_lifecycle_notifications_enabled(platform):
+                return None
             adapter = self.adapters.get(platform)
             if not adapter:
                 logger.debug(
@@ -16288,6 +16306,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
+            if not _gateway_lifecycle_notifications_enabled(platform):
+                continue
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
