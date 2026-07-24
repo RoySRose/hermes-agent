@@ -2571,6 +2571,84 @@ def test_interim_commentary_deduplicates_identical_items_in_one_response(monkeyp
     assert observed == ["Still working."]
 
 
+def test_interim_tool_call_uses_explicit_codex_reasoning_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: observed.append(text)
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "private chain of thought",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Checking the repository now.",
+    )
+
+    assert observed == ["Checking the repository now."]
+
+
+def test_interim_tool_call_prefers_visible_content_over_codex_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: observed.append(text)
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Visible progress.",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Summary fallback.",
+    )
+
+    assert observed == ["Visible progress."]
+
+
+def test_interim_tool_call_does_not_expose_raw_reasoning(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: observed.append(text)
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "private chain of thought",
+            "tool_calls": [{"id": "call_1"}],
+        }
+    )
+
+    assert observed == []
+
+
+def test_interim_non_codex_tool_call_does_not_expose_reasoning_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.api_mode = "chat_completions"
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: observed.append(text)
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Explicit but non-Codex summary.",
+    )
+
+    assert observed == []
+
+
 def test_stream_delta_strips_leaked_memory_context(monkeypatch):
     agent = _build_agent(monkeypatch)
     observed = []

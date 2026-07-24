@@ -5010,7 +5010,14 @@ def run_conversation(
                 )
                 messages.append(assistant_msg)
                 if not duplicate_previous_interim:
-                    agent._emit_interim_assistant_message(assistant_msg)
+                    agent._emit_interim_assistant_message(
+                        assistant_msg,
+                        codex_reasoning_summary=getattr(
+                            assistant_message,
+                            "codex_reasoning_summary",
+                            None,
+                        ),
+                    )
 
                 # Mixed batch: error-result the invalid calls and strip them
                 # from the execution set. The assistant message above keeps

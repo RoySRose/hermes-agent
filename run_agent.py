@@ -5030,7 +5030,10 @@ class AIAgent:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(
-        self, assistant_msg: Dict[str, Any]
+        self,
+        assistant_msg: Dict[str, Any],
+        *,
+        codex_reasoning_summary: Optional[str] = None,
     ) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
@@ -5063,6 +5066,15 @@ class AIAgent:
             if commentary_parts
             else self._interim_assistant_visible_text(assistant_msg)
         )
+        if (
+            not visible
+            and getattr(self, "api_mode", None) == "codex_responses"
+            and bool(assistant_msg.get("tool_calls"))
+            and isinstance(codex_reasoning_summary, str)
+        ):
+            visible = self._strip_think_blocks(codex_reasoning_summary).strip()
+            if visible:
+                visible = redact_sensitive_text(visible, force=True)
         if (
             not visible
             or visible == "(empty)"
