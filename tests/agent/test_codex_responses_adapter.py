@@ -66,7 +66,66 @@ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
     assert finish_reason == "incomplete"
     assert assistant_message.content == ""
     assert assistant_message.reasoning == "still thinking"
+    assert assistant_message.codex_reasoning_summary == "still thinking"
     assert assistant_message.codex_reasoning_items is None
+
+
+def test_normalize_codex_response_preserves_only_explicit_reasoning_summaries():
+    response = SimpleNamespace(
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                text="private first chain of thought",
+                summary=[SimpleNamespace(text="first visible summary")],
+            ),
+            SimpleNamespace(
+                type="reasoning",
+                text="private second chain of thought",
+                summary=[SimpleNamespace(text="second visible summary")],
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="fc_1",
+                call_id="call_1",
+                name="terminal",
+                arguments="{}",
+            ),
+        ],
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "tool_calls"
+    assert assistant_message.codex_reasoning_summary == (
+        "first visible summary\n\nsecond visible summary"
+    )
+
+
+def test_normalize_codex_response_does_not_promote_raw_reasoning_text_to_summary():
+    response = SimpleNamespace(
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                text="private chain of thought",
+                summary=[],
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="fc_1",
+                call_id="call_1",
+                name="terminal",
+                arguments="{}",
+            ),
+        ],
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "tool_calls"
+    assert assistant_message.reasoning == "private chain of thought"
+    assert assistant_message.codex_reasoning_summary is None
 
 
 # ---------------------------------------------------------------------------

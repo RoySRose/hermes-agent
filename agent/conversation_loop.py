@@ -4501,7 +4501,14 @@ def run_conversation(
                 agent._post_tool_empty_retried = False
 
                 messages.append(assistant_msg)
-                agent._emit_interim_assistant_message(assistant_msg)
+                agent._emit_interim_assistant_message(
+                    assistant_msg,
+                    codex_reasoning_summary=getattr(
+                        assistant_message,
+                        "codex_reasoning_summary",
+                        None,
+                    ),
+                )
                 try:
                     # Persist the assistant tool-call turn before any tool
                     # side effects run. If a destructive tool restarts or

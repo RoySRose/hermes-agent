@@ -4580,14 +4580,30 @@ class AIAgent:
         )
         return bool(streamed) and streamed == visible_content
 
-    def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
+    def _emit_interim_assistant_message(
+        self,
+        assistant_msg: Dict[str, Any],
+        *,
+        codex_reasoning_summary: Optional[str] = None,
+    ) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer."""
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
+        if (
+            not visible
+            and self.api_mode == "codex_responses"
+            and bool(assistant_msg.get("tool_calls"))
+            and isinstance(codex_reasoning_summary, str)
+        ):
+            visible = self._strip_think_blocks(codex_reasoning_summary).strip()
         if not visible or visible == "(empty)":
+            return
+        from agent.redact import redact_sensitive_text
+        visible = redact_sensitive_text(visible, force=True)
+        if not visible:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
