@@ -17304,6 +17304,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
         ("agent", "disabled_toolsets"),
+        # [local-patch] hot-apply-reasoning-effort: cached agents freeze their
+        # reasoning_config at construction, so a config.yaml effort edit must
+        # rebuild the agent on the next turn (model.default already busts via
+        # the signature's model argument; effort needs an explicit key).
+        ("agent", "reasoning_effort"),
         ("memory", "provider"),
     )
 
