@@ -320,6 +320,37 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_profile_default_delivery_overrides_origin(self, tmp_cron_dir, monkeypatch):
+        from hermes_cli import config as config_module
+
+        monkeypatch.setattr(
+            config_module,
+            "load_config",
+            lambda: {"cron": {"default_delivery": "local"}},
+        )
+        job = create_job(
+            prompt="Test",
+            schedule="30m",
+            origin={"platform": "discord", "chat_id": "123"},
+        )
+        assert job["deliver"] == "local"
+
+    def test_explicit_delivery_beats_profile_default(self, tmp_cron_dir, monkeypatch):
+        from hermes_cli import config as config_module
+
+        monkeypatch.setattr(
+            config_module,
+            "load_config",
+            lambda: {"cron": {"default_delivery": "local"}},
+        )
+        job = create_job(
+            prompt="Test",
+            schedule="30m",
+            deliver="slack",
+            origin={"platform": "discord", "chat_id": "123"},
+        )
+        assert job["deliver"] == "slack"
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
