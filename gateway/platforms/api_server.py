@@ -4912,7 +4912,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         # [local-patch] run-interim-assistant-events
-        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+        def _interim_assistant_cb(
+            text: str,
+            *,
+            already_streamed: bool = False,
+            kind: str = "commentary",
+        ) -> None:
             """Expose only completed, visible interim assistant messages."""
             nonlocal interim_sequence
             agent = agent_ref[0]
@@ -4948,6 +4953,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "event_id": event_id,
                 "timestamp": time.time(),
                 "content": visible,
+                "kind": kind,
             }
             self._set_run_status(run_id, "running", last_event=event["event"])
             try:

@@ -5066,6 +5066,7 @@ class AIAgent:
             if commentary_parts
             else self._interim_assistant_visible_text(assistant_msg)
         )
+        kind = "commentary"
         if (
             not visible
             and getattr(self, "api_mode", None) == "codex_responses"
@@ -5075,6 +5076,7 @@ class AIAgent:
             visible = self._strip_think_blocks(codex_reasoning_summary).strip()
             if visible:
                 visible = redact_sensitive_text(visible, force=True)
+                kind = "reasoning_summary"
         if (
             not visible
             or visible == "(empty)"
@@ -5083,7 +5085,15 @@ class AIAgent:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
-            cb(visible, already_streamed=already_streamed)
+            try:
+                cb(visible, already_streamed=already_streamed, kind=kind)
+            except TypeError as exc:
+                # Keep callbacks predating the kind keyword compatible. Retry
+                # only argument-binding failures, never TypeError from inside
+                # the callback (which would otherwise deliver twice).
+                if exc.__traceback__ is not None and exc.__traceback__.tb_next is not None:
+                    raise
+                cb(visible, already_streamed=already_streamed)
             if undelivered_parts:
                 for part in undelivered_parts:
                     self._record_delivered_interim_text(part)

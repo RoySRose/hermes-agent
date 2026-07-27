@@ -20119,10 +20119,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
-            def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            def _interim_assistant_cb(
+                text: str,
+                *,
+                already_streamed: bool = False,
+                kind: str = "commentary",
+            ) -> None:
                 if not _run_still_current():
                     return
                 display_text = text
+                # [local-patch] reasoning-summary-consumer-gate
+                # Codex reasoning summaries are scratch text, not deliberate
+                # commentary.  Chat surfaces only relay them when the platform's
+                # show_reasoning is on; the /v1/runs consumer keeps its own policy.
+                if kind == "reasoning_summary":
+                    try:
+                        _summary_visible = _resolve_gateway_display_bool(
+                            user_config,
+                            platform_key,
+                            "show_reasoning",
+                            default=bool(getattr(self, "_show_reasoning", False)),
+                            platform=source.platform,
+                            require_platform_override_for={Platform.MATTERMOST},
+                        )
+                    except Exception:
+                        _summary_visible = (
+                            False
+                            if source.platform == Platform.MATTERMOST
+                            else bool(getattr(self, "_show_reasoning", False))
+                        )
+                    if not _summary_visible:
+                        return
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
