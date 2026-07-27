@@ -1495,6 +1495,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            ("POST", "/api/sessions/{session_id}/compress", self._handle_compress_session),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -2648,6 +2649,167 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+    async def _handle_compress_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/compress — on-demand session compaction.
+
+        Mirrors the chat-platform ``/compress`` slash command
+        (``gateway/slash_commands.py::_handle_compress_command``) but acts on
+        a SessionDB-addressed session id instead of a gateway transcript, so
+        HTTP clients (the Hub compaction button) can trigger it without a
+        chat-platform session behind it. Optional JSON body:
+        ``{"focus": "<topic>", "keep_last": <int>}`` — ``keep_last`` N does a
+        boundary-aware partial compress (head summarized, most recent N
+        exchanges kept verbatim); otherwise a full compress with optional
+        ``focus``.
+        """
+        # Hub's compaction button (agent_context.request_hermes_compaction in
+        # the ecosystem hub-api repo) POSTs here with an empty body against
+        # the Hub-addressed session_id ("hub-<channel>"). api_server had no
+        # compaction surface before this endpoint (Hub's button 501'd).
+        # [local-patch] session-compress-endpoint
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        history = await self._conversation_history_for_session(session_id)
+        msgs = [
+            {"role": m.get("role"), "content": m.get("content")}
+            for m in history
+            if m.get("role") in {"user", "assistant"} and m.get("content")
+        ]
+        if not msgs:
+            return web.json_response(
+                _openai_error(f"Session not found or empty: {session_id}", code="session_not_found"),
+                status=404,
+            )
+
+        # Busy check: `_active_run_agents` is populated only by `_handle_runs`
+        # (the /v1/runs control surface the Hub bridge actually talks to —
+        # see the run-session-history-load patch above), so checking it
+        # reliably catches an in-flight Hub-originated turn on this
+        # session_id. It does NOT see a concurrent turn started via
+        # `_handle_session_chat` (/api/sessions/{id}/chat), which never
+        # populates this dict — that surface has no in-flight registry of
+        # its own today. Documented gap, not fixed here: closing it would
+        # need a general per-session busy registry no handler maintains yet.
+        for _active_agent in list(self._active_run_agents.values()):
+            if getattr(_active_agent, "session_id", None) == session_id:
+                return web.json_response(
+                    _openai_error(f"Run in progress for session: {session_id}", code="session_busy"),
+                    status=409,
+                )
+
+        focus_topic = body.get("focus")
+        if focus_topic is not None and not isinstance(focus_topic, str):
+            return web.json_response(_openai_error("focus must be a string", code="invalid_focus"), status=400)
+        raw_keep_last = body.get("keep_last")
+        partial = isinstance(raw_keep_last, int) and not isinstance(raw_keep_last, bool) and raw_keep_last > 0
+        keep_last = raw_keep_last if partial else 0
+
+        from hermes_cli.partial_compress import (
+            rejoin_compressed_head_and_tail,
+            split_history_for_partial_compress,
+        )
+
+        tail: list = []
+        head = msgs
+        if partial:
+            head, tail = split_history_for_partial_compress(msgs, keep_last)
+            if not tail:
+                # Degenerate split (not enough history) — fall back to full.
+                partial = False
+                head = msgs
+
+        loop = asyncio.get_running_loop()
+
+        def _run() -> Dict[str, Any]:
+            from gateway.session_context import clear_session_vars
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            tokens = self._bind_api_server_session(
+                chat_id=session_id,
+                session_key=session_id,
+                session_id=session_id,
+            )
+            try:
+                tmp_agent = self._create_agent(session_id=session_id)
+                tmp_agent._print_fn = lambda *a, **kw: None
+                # Throwaway compression agent — don't let disposal stamp an
+                # end_reason onto the (still live, Hub-owned) session row.
+                tmp_agent._end_session_on_close = False
+
+                _sys_prompt = getattr(tmp_agent, "_cached_system_prompt", "") or ""
+                _tools = getattr(tmp_agent, "tools", None) or None
+                approx_tokens = estimate_request_tokens_rough(
+                    msgs, system_prompt=_sys_prompt, tools=_tools
+                )
+
+                compressor = tmp_agent.context_compressor
+                if not compressor.has_content_to_compress(head):
+                    return {"noop": True}
+
+                compressed, _ = tmp_agent._compress_context(
+                    head, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True
+                )
+                if partial and tail:
+                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
+
+                rotated = getattr(tmp_agent, "session_id", session_id) != session_id
+                return {"noop": False, "compressed": compressed, "rotated": rotated}
+            finally:
+                clear_session_vars(tokens)
+
+        result = await loop.run_in_executor(None, _run)
+
+        if result.get("noop"):
+            return web.json_response({
+                "ok": True,
+                "session_id": session_id,
+                "messages_before": len(history),
+                "messages_after": len(history),
+            })
+
+        compressed = result["compressed"]
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+
+        # Persist to the ORIGINAL url-path session_id regardless of whether
+        # _compress_context rotated internally (legacy/default mode ends the
+        # old id and mints a fresh continuation id, writing nothing back to
+        # the id we were called with) or compacted in place (same id,
+        # already durably archived+replaced by archive_and_compact). The Hub
+        # bridge always addresses this exact literal session_id
+        # ("hub-<channel>") via /v1/runs and never follows session lineage,
+        # so an unconditional replace_messages() is what makes the
+        # compressed result visible on the next read regardless of which
+        # internal path fired. (Accepted trade-off: in in-place mode this
+        # second write supersedes archive_and_compact's own soft-archive of
+        # the pre-compaction rows with a hard replace — acceptable since
+        # compression.in_place defaults to off "during rollout" today, and
+        # this endpoint's contract is simply "replace the session's stored
+        # messages with the compressed history".)
+        await asyncio.to_thread(db.replace_messages, session_id, compressed)
+        if result["rotated"]:
+            # Rotation stamped ended_at/end_reason="compression" onto the
+            # ORIGINAL row (the id we still address) inside _compress_context.
+            # Reopen it so the still-in-use Hub session doesn't show as ended.
+            try:
+                await asyncio.to_thread(db.reopen_session, session_id)
+            except Exception:
+                logger.debug("reopen_session failed for %s after compress", session_id, exc_info=True)
+
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "messages_before": len(history),
+            "messages_after": len(compressed),
+        })
 
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
