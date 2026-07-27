@@ -82,6 +82,107 @@ def _explode_runtime_resolution():
     )
 
 
+def _slack_source():
+    return SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_name="ops",
+        chat_type="channel",
+        user_id="U123",
+        thread_id="1700000000.000001",
+    )
+
+
+def test_slack_platform_model_default_overrides_profile_model(monkeypatch):
+    runner = _make_runner()
+    source = _slack_source()
+    config = {
+        "model": {"default": "gpt-5.6-sol", "provider": "cliproxy-codex"},
+        "platforms": {"slack": {"model": "gpt-5.6-terra"}},
+    }
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "model": "gpt-5.6-sol",
+            "provider": "cliproxy-codex",
+            "api_key": "***",
+            "base_url": "http://localhost:8317/v1",
+            "api_mode": "codex_responses",
+        },
+    )
+
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key=runner._session_key_for_source(source),
+        user_config=config,
+    )
+
+    assert model == "gpt-5.6-terra"
+    assert runtime["provider"] == "cliproxy-codex"
+    assert runtime["api_mode"] == "codex_responses"
+
+
+def test_session_model_override_beats_slack_platform_default(monkeypatch):
+    runner = _make_runner()
+    source = _slack_source()
+    session_key = runner._session_key_for_source(source)
+    runner._session_model_overrides[session_key] = _codex_override()
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
+
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key=session_key,
+        user_config={
+            "model": {"default": "gpt-5.6-sol"},
+            "platforms": {"slack": {"model": "gpt-5.6-terra"}},
+        },
+    )
+
+    assert model == "gpt-5.4"
+    assert runtime["provider"] == "openai-codex"
+
+
+def test_slack_platform_reasoning_default_overrides_profile(monkeypatch):
+    runner = _make_runner()
+    source = _slack_source()
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {
+            "agent": {"reasoning_effort": "xhigh"},
+            "platforms": {"slack": {"reasoning_effort": "medium"}},
+        },
+    )
+    runner._load_reasoning_config = lambda: {"enabled": True, "effort": "xhigh"}
+
+    reasoning = runner._resolve_session_reasoning_config(
+        source=source,
+        session_key=runner._session_key_for_source(source),
+    )
+
+    assert reasoning == {"enabled": True, "effort": "medium"}
+
+
+def test_session_reasoning_override_beats_slack_platform_default(monkeypatch):
+    runner = _make_runner()
+    source = _slack_source()
+    session_key = runner._session_key_for_source(source)
+    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"platforms": {"slack": {"reasoning_effort": "medium"}}},
+    )
+
+    reasoning = runner._resolve_session_reasoning_config(
+        source=source,
+        session_key=session_key,
+    )
+
+    assert reasoning == {"enabled": True, "effort": "high"}
+
+
 def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
