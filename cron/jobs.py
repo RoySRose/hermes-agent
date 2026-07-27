@@ -1069,6 +1069,31 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _resolve_default_delivery(origin: Optional[Dict[str, Any]]) -> str:
+    """Resolve the profile-level default cron delivery target.
+
+    ``cron.default_delivery`` lets a profile opt out of the historical
+    origin-chat default. This is useful for web/UI-first profiles where a stale
+    messaging origin (for example Discord) must never receive unattended cron
+    completions. Explicit per-job ``deliver`` values still win.
+    """
+    fallback = "origin" if origin else "local"
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        raw_default = (
+            cron_cfg.get("default_delivery") if isinstance(cron_cfg, dict) else None
+        )
+        configured = str(raw_default).strip() if raw_default is not None else ""
+        if configured:
+            return configured
+    except Exception as exc:
+        logger.debug("Failed to resolve cron.default_delivery: %s", exc)
+    return fallback
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1145,9 +1170,10 @@ def create_job(
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
 
-    # Default delivery to origin if available, otherwise local
+    # Default delivery follows the profile policy when configured, otherwise
+    # preserves the historical origin-if-available / local fallback.
     if deliver is None:
-        deliver = "origin" if origin else "local"
+        deliver = _resolve_default_delivery(origin)
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
