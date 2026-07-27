@@ -627,6 +627,28 @@ class CommentaryAgent:
         }
 
 
+class ReasoningSummaryAgent:
+    """Emits a Codex reasoning-summary interim plus a real commentary interim."""
+
+    def __init__(self, **kwargs):
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback(
+                "**Planning the repo sweep**", already_streamed=False, kind="reasoning_summary"
+            )
+            self.interim_assistant_callback(
+                "I'll inspect the repo first.", already_streamed=False, kind="commentary"
+            )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -985,6 +1007,47 @@ async def test_run_agent_interim_commentary_works_with_tool_progress_off(monkeyp
 
     assert result.get("already_sent") is not True
     assert any(call["content"] == "I'll inspect the repo first." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_drops_reasoning_summary_when_show_reasoning_off(monkeypatch, tmp_path):
+    """Codex reasoning summaries must not leak to chat surfaces that keep
+    show_reasoning off — real commentary from the same turn still lands."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReasoningSummaryAgent,
+        session_id="sess-reasoning-summary-off",
+        config_data={
+            "display": {
+                "interim_assistant_messages": True,
+                "show_reasoning": False,
+            }
+        },
+    )
+
+    assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_relays_reasoning_summary_when_show_reasoning_on(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReasoningSummaryAgent,
+        session_id="sess-reasoning-summary-on",
+        config_data={
+            "display": {
+                "interim_assistant_messages": True,
+                "show_reasoning": True,
+            }
+        },
+    )
+
+    assert [call["content"] for call in adapter.sent] == [
+        "**Planning the repo sweep**",
+        "I'll inspect the repo first.",
+    ]
 
 
 @pytest.mark.asyncio

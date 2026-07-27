@@ -4592,6 +4592,7 @@ class AIAgent:
             return
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
+        kind = "commentary"
         if (
             not visible
             and self.api_mode == "codex_responses"
@@ -4599,6 +4600,10 @@ class AIAgent:
             and isinstance(codex_reasoning_summary, str)
         ):
             visible = self._strip_think_blocks(codex_reasoning_summary).strip()
+            if visible:
+                # Reasoning summaries are scratch text, not deliberate output.
+                # Consumers gate them on their own display settings.
+                kind = "reasoning_summary"
         if not visible or visible == "(empty)":
             return
         from agent.redact import redact_sensitive_text
@@ -4607,7 +4612,16 @@ class AIAgent:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
-            cb(visible, already_streamed=already_streamed)
+            try:
+                cb(visible, already_streamed=already_streamed, kind=kind)
+            except TypeError as exc:
+                # Callbacks predating the kind keyword stay supported.  Only an
+                # argument-binding failure is retried: that traceback stops in
+                # this frame, whereas a TypeError raised inside the callback
+                # carries deeper frames and must not deliver the message twice.
+                if exc.__traceback__ is not None and exc.__traceback__.tb_next is not None:
+                    raise
+                cb(visible, already_streamed=already_streamed)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 

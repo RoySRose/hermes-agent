@@ -347,11 +347,53 @@ class TestRunEvents:
             f"{run_id}:interim:1",
         ]
         assert [event["content"] for event in interim] == ["실제 중간 진행", "두 번째 진행"]
+        assert [event["kind"] for event in interim] == ["commentary", "commentary"]
         assert all(
             not ({"reasoning", "args", "preview", "result", "output", "usage"} & event.keys())
             for event in interim
         )
         assert any(event.get("event") == "run.completed" and event.get("output") == "최종 답변" for event in events)
+
+    @pytest.mark.asyncio
+    async def test_events_stream_emits_reasoning_summary_interim_with_kind(self, adapter):
+        """Hive shows process: reasoning-summary interim still reaches the queue,
+        tagged so the UI can render it differently from real commentary."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                callback = kwargs["interim_assistant_callback"]
+                agent = MagicMock()
+                agent._strip_think_blocks.side_effect = lambda text: text
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+
+                def run_conversation(**_run_kwargs):
+                    callback("Checking the repository now.", kind="reasoning_summary")
+                    callback("실제 중간 진행", kind="commentary")
+                    return {"final_response": "최종 답변"}
+
+                agent.run_conversation.side_effect = run_conversation
+                agent.session_prompt_tokens = 0
+                agent.session_completion_tokens = 0
+                agent.session_total_tokens = 0
+                return agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        interim = [event for event in events if event.get("event") == "assistant.interim.completed"]
+        assert [(event["content"], event["kind"]) for event in interim] == [
+            ("Checking the repository now.", "reasoning_summary"),
+            ("실제 중간 진행", "commentary"),
+        ]
 
     def test_run_event_callback_exposes_only_skill_view_name(self, adapter):
         run_id = "run_skill"
