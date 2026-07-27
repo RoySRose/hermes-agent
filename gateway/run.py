@@ -2624,6 +2624,38 @@ def _load_gateway_runtime_config() -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
+def _resolve_platform_agent_defaults(
+    platform: Optional["Platform"],
+    config: dict | None = None,
+) -> dict:
+    """Resolve optional model/reasoning defaults for one gateway platform.
+
+    Platform defaults live under ``platforms.<platform>`` and are applied only
+    when the session has no explicit ``/model`` or ``/reasoning`` override.
+    This keeps the profile-wide defaults as the fallback while allowing a
+    surface such as Slack to use a cheaper/faster model without splitting the
+    profile's memories, skills, or session store.
+    """
+    if platform is None:
+        return {}
+    cfg = config if isinstance(config, dict) else _load_gateway_runtime_config()
+    platforms = cfg.get("platforms", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(platforms, dict):
+        return {}
+    platform_cfg = platforms.get(_platform_config_key(platform), {})
+    if not isinstance(platform_cfg, dict):
+        return {}
+
+    defaults: dict[str, str] = {}
+    model = str(platform_cfg.get("model") or "").strip()
+    if model:
+        defaults["model"] = model
+    effort = str(platform_cfg.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        defaults["reasoning_effort"] = effort
+    return defaults
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -4103,8 +4135,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve model/runtime for a session.
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        platform default → global config/env.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -4116,6 +4147,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         model = _resolve_gateway_model(user_config)
         if resolved_session_key:
             self._rehydrate_session_model_override(resolved_session_key)
+        platform = getattr(source, "platform", None) if source is not None else None
+        if platform is None and resolved_session_key:
+            parsed_key = _parse_session_key(resolved_session_key)
+            platform_name = parsed_key.get("platform") if parsed_key else None
+            if platform_name:
+                try:
+                    platform = Platform(platform_name)
+                except ValueError:
+                    platform = None
+        platform_defaults = _resolve_platform_agent_defaults(platform, user_config)
+        platform_model = platform_defaults.get("model")
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -4161,6 +4203,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             model = runtime_model
 
+        if platform_model and not override:
+            logger.info(
+                "Platform model default applied: platform=%s %s -> %s",
+                _platform_config_key(platform) if platform is not None else "unknown",
+                model,
+                platform_model,
+            )
+            model = platform_model
+
         cfg = getattr(self, "config", None)
         if cfg and source is not None:
             chat_id = str(source.chat_id) if source.chat_id else ""
@@ -4191,7 +4242,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # did not specify an explicit model.
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
-
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -5238,6 +5288,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+
+        platform = getattr(source, "platform", None) if source is not None else None
+        if platform is None and resolved_session_key:
+            parsed_key = _parse_session_key(resolved_session_key)
+            platform_name = parsed_key.get("platform") if parsed_key else None
+            if platform_name:
+                try:
+                    platform = Platform(platform_name)
+                except ValueError:
+                    platform = None
+        effort = _resolve_platform_agent_defaults(platform).get("reasoning_effort")
+        if effort == "none":
+            return {"enabled": False}
+        if effort in {"minimal", "low", "medium", "high", "xhigh"}:
+            return {"enabled": True, "effort": effort}
+        if effort:
+            logger.warning(
+                "Unknown platform reasoning_effort '%s' for %s; using profile default",
+                effort,
+                _platform_config_key(platform) if platform is not None else "unknown",
+            )
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
