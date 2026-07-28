@@ -3446,6 +3446,9 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
+    _CRON_OUTPUT_FILENAME_RE = __import__("re").compile(r"\d{8}_\d{6}\.md")
+    _MAX_CRON_OUTPUT_ITEMS = 100
+    _MAX_CRON_OUTPUT_BYTES = 1_048_576
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
     _MAX_NAME_LENGTH = 200
@@ -3473,6 +3476,94 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": "Invalid job ID format"}, status=400,
             )
         return job_id, None
+
+    def _cron_output_root(self) -> Path:
+        """Return this profile's persisted local cron-output directory."""
+        from hermes_cli.config import get_hermes_home
+
+        return get_hermes_home() / "cron" / "output"
+
+    def _cron_output_path(self, job_id: str, filename: str) -> Optional[Path]:
+        """Resolve one persisted cron output while rejecting traversal/symlinks."""
+        if not self._JOB_ID_RE.fullmatch(job_id):
+            return None
+        if not self._CRON_OUTPUT_FILENAME_RE.fullmatch(filename):
+            return None
+        root = self._cron_output_root().resolve()
+        candidate = root / job_id / filename
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            return None
+        if candidate.is_symlink() or not resolved.is_relative_to(root) or not resolved.is_file():
+            return None
+        return resolved
+
+    async def _handle_list_cron_outputs(self, request: "web.Request") -> "web.Response":
+        """GET /api/cron/outputs — list locally persisted cron outputs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            try:
+                limit = int(request.query.get("limit", str(self._MAX_CRON_OUTPUT_ITEMS)))
+            except ValueError:
+                return web.json_response({"error": "limit must be an integer"}, status=400)
+            if not 1 <= limit <= self._MAX_CRON_OUTPUT_ITEMS:
+                return web.json_response(
+                    {"error": f"limit must be between 1 and {self._MAX_CRON_OUTPUT_ITEMS}"},
+                    status=400,
+                )
+            root = self._cron_output_root()
+            outputs = []
+            if root.exists():
+                for job_dir in root.iterdir():
+                    if not job_dir.is_dir() or job_dir.is_symlink() or not self._JOB_ID_RE.fullmatch(job_dir.name):
+                        continue
+                    for path in job_dir.glob("*.md"):
+                        if path.is_symlink() or not self._CRON_OUTPUT_FILENAME_RE.fullmatch(path.name):
+                            continue
+                        try:
+                            stat = path.stat()
+                            with path.open("r", encoding="utf-8", errors="replace") as output_file:
+                                first_line = output_file.readline().strip()
+                        except OSError:
+                            continue
+                        outputs.append({
+                            "job_id": job_dir.name,
+                            "filename": path.name,
+                            "title": first_line.removeprefix("# ") if first_line.startswith("# ") else "Cron output",
+                            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(stat.st_mtime)),
+                            "size_bytes": stat.st_size,
+                        })
+            outputs.sort(key=lambda item: item["created_at"], reverse=True)
+            return web.json_response({"outputs": outputs[:limit]})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_get_cron_output(self, request: "web.Request") -> "web.Response":
+        """GET /api/cron/outputs/{job_id}/{filename} — read one cron output."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        job_id = request.match_info["job_id"]
+        filename = request.match_info["filename"]
+        path = self._cron_output_path(job_id, filename)
+        if path is None:
+            return web.json_response({"error": "Cron output not found"}, status=404)
+        try:
+            size = path.stat().st_size
+            if size > self._MAX_CRON_OUTPUT_BYTES:
+                return web.json_response(
+                    {"error": "Cron output exceeds the 1 MiB read limit"}, status=413,
+                )
+            return web.json_response({
+                "job_id": job_id,
+                "filename": filename,
+                "content": path.read_text(encoding="utf-8", errors="replace"),
+            })
+        except OSError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
@@ -4778,6 +4869,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Cron jobs management API
+            self._app.router.add_get("/api/cron/outputs", self._handle_list_cron_outputs)
+            self._app.router.add_get("/api/cron/outputs/{job_id}/{filename}", self._handle_get_cron_output)
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
             self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
