@@ -312,18 +312,6 @@ Resume a previously paused job.
 
 Trigger the job to run immediately, out of schedule.
 
-### GET /api/cron/outputs
-
-List persisted local cron results for an admin UI. Results are newest first and
-include the job ID, filename, title, timestamp, and size. Pass `limit` from 1
-to 100 to constrain the response.
-
-### GET /api/cron/outputs/\{job_id\}/\{filename\}
-
-Read one persisted local cron result. The endpoint accepts only canonical cron
-job IDs and timestamped Markdown filenames, rejects path traversal and symlinks,
-and limits a single response to 1 MiB.
-
 ## Sessions API (session control over REST)
 
 External UIs can manage Hermes sessions over REST without standing up the dashboard. All endpoints are gated by `API_SERVER_KEY` and live under `/api/sessions/*`.

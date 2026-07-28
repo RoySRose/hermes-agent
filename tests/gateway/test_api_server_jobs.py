@@ -54,8 +54,6 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     # Register only job routes (plus health for sanity)
     app.router.add_get("/health", adapter._handle_health)
-    app.router.add_get("/api/cron/outputs", adapter._handle_list_cron_outputs)
-    app.router.add_get("/api/cron/outputs/{job_id}/{filename}", adapter._handle_get_cron_output)
     app.router.add_get("/api/jobs", adapter._handle_list_jobs)
     app.router.add_post("/api/jobs", adapter._handle_create_job)
     app.router.add_get("/api/jobs/{job_id}", adapter._handle_get_job)
@@ -131,54 +129,6 @@ class TestListJobs:
                 resp = await cli.get("/api/jobs")
                 assert resp.status == 200
                 mock_list.assert_called_once_with(include_disabled=False)
-
-
-# ---------------------------------------------------------------------------
-# Cron output history
-# ---------------------------------------------------------------------------
-
-class TestCronOutputs:
-    @pytest.mark.asyncio
-    async def test_list_and_read_persisted_output(self, adapter, tmp_path, monkeypatch):
-        from hermes_cli import config as config_module
-
-        monkeypatch.setattr(config_module, "get_hermes_home", lambda: tmp_path)
-        output_dir = tmp_path / "cron" / "output" / VALID_JOB_ID
-        output_dir.mkdir(parents=True)
-        output_file = output_dir / "20260727_210000.md"
-        output_file.write_text("# Hive brief\n\nresult body\n", encoding="utf-8")
-
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            listing = await cli.get("/api/cron/outputs")
-            assert listing.status == 200
-            outputs = (await listing.json())["outputs"]
-            assert len(outputs) == 1
-            assert outputs[0]["job_id"] == VALID_JOB_ID
-            assert outputs[0]["filename"] == "20260727_210000.md"
-            assert outputs[0]["title"] == "Hive brief"
-            assert outputs[0]["size_bytes"] == len("# Hive brief\n\nresult body\n")
-
-            detail = await cli.get(f"/api/cron/outputs/{VALID_JOB_ID}/20260727_210000.md")
-            assert detail.status == 200
-            assert (await detail.json())["content"] == "# Hive brief\n\nresult body\n"
-
-    @pytest.mark.asyncio
-    async def test_output_rejects_invalid_paths(self, adapter, tmp_path, monkeypatch):
-        from hermes_cli import config as config_module
-
-        monkeypatch.setattr(config_module, "get_hermes_home", lambda: tmp_path)
-        app = _create_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            response = await cli.get("/api/cron/outputs/not-a-job/20260727_210000.md")
-            assert response.status == 404
-
-    @pytest.mark.asyncio
-    async def test_output_list_requires_auth(self, auth_adapter):
-        app = _create_app(auth_adapter)
-        async with TestClient(TestServer(app)) as cli:
-            response = await cli.get("/api/cron/outputs")
-            assert response.status == 401
 
 
 # ---------------------------------------------------------------------------
