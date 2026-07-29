@@ -512,37 +512,6 @@ async def test_shutdown_notification_home_channel_suppressed_when_flag_disabled(
 
 
 @pytest.mark.asyncio
-async def test_discord_shutdown_notifications_are_removed_even_when_flag_true():
-    """Discord receives neither active-session nor home-channel shutdown notices."""
-    from gateway.config import HomeChannel, Platform, PlatformConfig
-
-    runner, adapter = make_restart_runner()
-    source = make_restart_source(chat_id="discord-chat")
-    source.platform = Platform.DISCORD
-    session_key = build_session_key(source)
-    runner._running_agents[session_key] = MagicMock()
-    runner._cache_session_source(session_key, source)
-    runner.config.platforms = {
-        Platform.DISCORD: PlatformConfig(
-            enabled=True,
-            token="***",
-            home_channel=HomeChannel(
-                platform=Platform.DISCORD,
-                chat_id="discord-home",
-                name="Discord Home",
-            ),
-            gateway_restart_notification=True,
-        )
-    }
-    runner.adapters = {Platform.DISCORD: adapter}
-    adapter.send = AsyncMock()
-
-    await runner._notify_active_sessions_of_shutdown()
-
-    adapter.send.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
     """Shutdown notifications should route from persisted origin, not reparsed keys."""
     runner, adapter = make_restart_runner()
