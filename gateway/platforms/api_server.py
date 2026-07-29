@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -5042,6 +5043,7 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
+        loop_thread_id = threading.get_ident()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
         self._run_streams[run_id] = q
@@ -5119,7 +5121,23 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             self._set_run_status(run_id, "running", last_event=event["event"])
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                if threading.get_ident() == loop_thread_id:
+                    _put_event_if_active(event)
+                else:
+                    enqueued = threading.Event()
+
+                    def _enqueue_interim() -> None:
+                        try:
+                            _put_event_if_active(event)
+                        finally:
+                            enqueued.set()
+
+                    loop.call_soon_threadsafe(_enqueue_interim)
+                    # Preserve event ordering across executor completion: the
+                    # run.completed event and closing sentinel must not overtake
+                    # a completed interim message. Bound the wait so loop
+                    # shutdown cannot strand the executor thread indefinitely.
+                    enqueued.wait(timeout=2.0)
             except Exception:
                 pass
 
