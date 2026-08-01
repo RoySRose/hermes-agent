@@ -12,6 +12,7 @@ import asyncio
 import json
 import threading
 import time
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -67,6 +68,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/meta", adapter._handle_runs_meta)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -145,6 +147,169 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_reuses_one_run_and_rejects_changed_payload(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "delivery-1"}
+                first = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                second = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                assert first.status == second.status == 202
+                assert await first.json() == await second.json()
+                assert ready.wait(timeout=1)
+                assert mock_create.call_count == 1
+                changed = await cli.post("/v1/runs", json={"input": "changed"}, headers=headers)
+                assert changed.status == 409
+
+    @pytest.mark.asyncio
+    async def test_expected_generation_mismatch_rejects_before_admission(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello"}, headers={
+                    "Idempotency-Key": "delivery-1",
+                    "X-Hermes-Expected-Generation": str(uuid.uuid4()),
+                },
+            )
+            assert response.status == 409
+            assert adapter._run_admissions == {}
+            assert adapter._run_statuses == {}
+            assert adapter._run_streams == {}
+            assert adapter._active_run_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_generation_flip_between_meta_and_post_rejects_without_run(self, adapter):
+        app = _create_runs_app(adapter)
+        expected = adapter._server_generation
+        adapter._server_generation = str(uuid.uuid4())
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello"}, headers={
+                    "Idempotency-Key": "delivery-1",
+                    "X-Hermes-Expected-Generation": expected,
+                },
+            )
+            assert response.status == 409
+            assert adapter._run_admissions == {}
+            assert adapter._run_statuses == {}
+            assert adapter._run_streams == {}
+
+    @pytest.mark.asyncio
+    async def test_expected_generation_invalid_rejects_before_admission(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello"}, headers={
+                    "Idempotency-Key": "delivery-1",
+                    "X-Hermes-Expected-Generation": "not-a-generation",
+                },
+            )
+            assert response.status == 400
+            assert adapter._run_admissions == {}
+            assert adapter._run_statuses == {}
+            assert adapter._run_streams == {}
+
+    @pytest.mark.asyncio
+    async def test_runs_without_expected_generation_remain_compatible(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello"},
+                headers={"Idempotency-Key": "delivery-1"},
+            )
+            assert response.status == 202
+
+    @pytest.mark.asyncio
+    async def test_admission_capacity_preserves_active_replay_and_expires_terminal(self, adapter, monkeypatch):
+        monkeypatch.setattr(adapter, "_MAX_RUN_ADMISSIONS", 2)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                first = await cli.post("/v1/runs", json={"input": "one"}, headers={"Idempotency-Key": "one"})
+                second = await cli.post("/v1/runs", json={"input": "two"}, headers={"Idempotency-Key": "two"})
+                assert first.status == second.status == 202
+                assert ready.wait(timeout=1)
+                rejected = await cli.post("/v1/runs", json={"input": "three"}, headers={"Idempotency-Key": "three"})
+                assert rejected.status == 503
+                assert len(adapter._run_admissions) == 2
+                assert len(adapter._run_statuses) == 2
+                assert len(adapter._run_streams) == 2
+                assert mock_create.call_count == 2
+                replay = await cli.post("/v1/runs", json={"input": "one"}, headers={"Idempotency-Key": "one"})
+                assert replay.status == 202
+                assert await replay.json() == await first.json()
+                assert mock_create.call_count == 2
+
+                oldest = adapter._run_admissions["one"]
+                oldest["terminal"] = True
+                oldest["updated_at"] = __import__("time").time()
+                still_rejected = await cli.post("/v1/runs", json={"input": "three"}, headers={"Idempotency-Key": "three"})
+                assert still_rejected.status == 503
+                assert len(adapter._run_admissions) == 2
+
+                oldest["updated_at"] = 0
+                admitted = await cli.post("/v1/runs", json={"input": "three"}, headers={"Idempotency-Key": "three"})
+                assert admitted.status == 202
+                assert "one" not in adapter._run_admissions
+                assert len(adapter._run_admissions) == 2
+                assert mock_create.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_oversized_idempotency_key_is_rejected_before_run_allocation(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello"},
+                headers={"Idempotency-Key": "x" * 257},
+            )
+            assert response.status == 400
+            assert adapter._run_statuses == {}
+            assert adapter._run_streams == {}
+            assert adapter._active_run_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_empty_idempotency_key_is_rejected_before_run_allocation(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs", json={"input": "hello"}, headers={"Idempotency-Key": "   "},
+            )
+            assert response.status == 400
+            assert adapter._run_statuses == {}
+            assert adapter._run_streams == {}
+
+    @pytest.mark.asyncio
+    async def test_idempotency_fingerprint_includes_memory_scope(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "delivery-1"}
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+            assert first.status == 202
+            changed = await cli.post(
+                "/v1/runs", json={"input": "hello"},
+                headers={**headers, "X-Hermes-Session-Key": "scope-two"},
+            )
+            assert changed.status == 409
+
+    @pytest.mark.asyncio
+    async def test_runs_meta_requires_auth_and_has_process_generation(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            assert (await cli.get("/v1/runs/meta")).status == 401
+            response = await cli.get("/v1/runs/meta", headers={"Authorization": "Bearer sk-secret"})
+            assert response.status == 200
+            data = await response.json()
+            assert data == {
+                "server_generation": auth_adapter._server_generation,
+                "idempotency": "v1",
+                "idempotency_ttl_seconds": auth_adapter._RUN_ADMISSION_TTL,
+            }
 
     @pytest.mark.asyncio
     async def test_start_invalid_json_returns_400(self, adapter):

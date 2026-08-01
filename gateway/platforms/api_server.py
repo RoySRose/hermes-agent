@@ -576,7 +576,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Expected-Generation",
 }
 
 
@@ -986,6 +986,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # [local-patch] run-admission-idempotency
+        # Process-local admission records deliberately retain only a digest and
+        # acceptance receipt, never request bodies. They are the idempotency
+        # boundary before asynchronous work is scheduled.
+        self._server_generation = str(uuid.uuid4())
+        self._run_admissions: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -4875,6 +4881,66 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_ADMISSION_TTL = _RUN_STATUS_TTL
+    _MAX_RUN_ADMISSIONS = 1024
+    _MAX_IDEMPOTENCY_KEY_LENGTH = 256
+    _MAX_EXPECTED_GENERATION_LENGTH = 64
+    _TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+    @staticmethod
+    def _run_admission_fingerprint(body: Dict[str, Any], gateway_session_key: Optional[str]) -> str:
+        """Digest every input that can change /v1/runs admission semantics."""
+        semantic = {
+            "input": body.get("input"),
+            "instructions": body.get("instructions"),
+            "previous_response_id": body.get("previous_response_id"),
+            "conversation_history": body.get("conversation_history"),
+            "session_id": body.get("session_id"),
+            "model": body.get("model"),
+            "gateway_session_key": gateway_session_key,
+        }
+        encoded = json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _sweep_run_admissions(self) -> None:
+        """Expire terminal receipts without ever dropping a live admission."""
+        now = time.time()
+        expired = [
+            key for key, entry in self._run_admissions.items()
+            if entry.get("terminal") and now - float(entry.get("updated_at", now)) > self._RUN_ADMISSION_TTL
+        ]
+        for key in expired:
+            self._run_admissions.pop(key, None)
+
+    def _reserve_run_admission(self, key: str, fingerprint: str, run_id: str) -> bool:
+        """Reserve bounded keyed admission before any async-visible run state.
+
+        Active and unexpired terminal records are never evicted; a full registry
+        fails closed until a terminal receipt has reached its advertised TTL.
+        This method runs synchronously on the aiohttp loop, so the reservation
+        precedes both status publication and task creation.
+        """
+        self._sweep_run_admissions()
+        if len(self._run_admissions) >= self._MAX_RUN_ADMISSIONS:
+            return False
+        now = time.time()
+        self._run_admissions[key] = {
+            "key": key,
+            "fingerprint": fingerprint,
+            "run_id": run_id,
+            "response_status": "started",
+            "terminal": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        return True
+
+    def _update_run_admission_status(self, run_id: str, status: str) -> None:
+        for entry in self._run_admissions.values():
+            if entry.get("run_id") == run_id:
+                entry["terminal"] = status in self._TERMINAL_RUN_STATUSES
+                entry["updated_at"] = time.time()
+                return
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -4889,6 +4955,7 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        self._update_run_admission_status(run_id, status)
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -4955,12 +5022,6 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
 
         try:
             body = await request.json()
@@ -5033,7 +5094,67 @@ class APIServerAdapter(BasePlatformAdapter):
             if _client_session_id:
                 conversation_history = await self._conversation_history_for_session(_client_session_id)
 
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        expected_generation = request.headers.get("X-Hermes-Expected-Generation")
+        if expected_generation is not None:
+            expected_generation = expected_generation.strip()
+            if (
+                not expected_generation
+                or len(expected_generation) > self._MAX_EXPECTED_GENERATION_LENGTH
+            ):
+                return web.json_response(
+                    _openai_error("X-Hermes-Expected-Generation is invalid"), status=400,
+                )
+            try:
+                uuid.UUID(expected_generation)
+            except (TypeError, ValueError, AttributeError):
+                return web.json_response(
+                    _openai_error("X-Hermes-Expected-Generation is invalid"), status=400,
+                )
+            # This comparison shares the request's admission critical section
+            # with lookup/reservation below: no run state exists before it.
+            if not hmac.compare_digest(expected_generation, self._server_generation):
+                return web.json_response(
+                    _openai_error("Hermes server generation mismatch", code="server_generation_mismatch"),
+                    status=409,
+                )
+        if "Idempotency-Key" in request.headers and not idempotency_key:
+            return web.json_response(
+                _openai_error("Idempotency-Key must be nonempty"), status=400,
+            )
+        if len(idempotency_key) > self._MAX_IDEMPOTENCY_KEY_LENGTH:
+            return web.json_response(
+                _openai_error("Idempotency-Key exceeds maximum length"), status=400,
+            )
+        if idempotency_key:
+            fingerprint = self._run_admission_fingerprint(body, gateway_session_key)
+            self._sweep_run_admissions()
+            admission = self._run_admissions.get(idempotency_key)
+            if admission is not None:
+                if not hmac.compare_digest(str(admission["fingerprint"]), fingerprint):
+                    return web.json_response(
+                        _openai_error("Idempotency-Key was already used with different admission inputs"),
+                        status=409,
+                    )
+                return web.json_response(
+                    {"run_id": admission["run_id"], "status": admission["response_status"]},
+                    status=202,
+                )
+
+        # A replay is accepted above even if capacity has since filled. New
+        # admissions remain subject to the shared concurrency limit.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         run_id = f"run_{uuid.uuid4().hex}"
+        if idempotency_key and not self._reserve_run_admission(
+            idempotency_key, fingerprint, run_id,
+        ):
+            return web.json_response(
+                _openai_error("Run admission registry is full", code="run_admission_capacity"),
+                status=503,
+            )
         session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -5377,6 +5498,17 @@ class APIServerAdapter(BasePlatformAdapter):
             status=202,
             headers=response_headers,
         )
+
+    async def _handle_runs_meta(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs/meta — process generation for safe admission recovery."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({
+            "server_generation": self._server_generation,
+            "idempotency": "v1",
+            "idempotency_ttl_seconds": self._RUN_ADMISSION_TTL,
+        })
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
