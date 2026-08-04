@@ -56,8 +56,18 @@ from gateway.platforms.base import (
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks
+    from .thread_mode import (
+        SLACK_THREAD_RESPONSE_MODE_SCHEMA,
+        _handle_slack_thread_response_mode,
+        get_thread_response_mode,
+    )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks  # type: ignore
+    from thread_mode import (  # type: ignore
+        SLACK_THREAD_RESPONSE_MODE_SCHEMA,
+        _handle_slack_thread_response_mode,
+        get_thread_response_mode,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -2908,8 +2918,9 @@ class SlackAdapter(BasePlatformAdapter):
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
+        explicitly_mentioned = bool(bot_uid and f"<@{bot_uid}>" in routing_text)
         is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
+            explicitly_mentioned
             or self._slack_message_matches_mention_patterns(routing_text)
         )
         mentioned_users_for_name = set(re.findall(r"<@([A-Z0-9]+)>", routing_text))
@@ -2924,8 +2935,25 @@ class SlackAdapter(BasePlatformAdapter):
         directly_addressed = is_mentioned or name_addressed
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        mention_only_thread_ts = (
+            event_thread_ts if is_thread_reply else (event_thread_ts or ts)
+        )
 
         if not is_dm and bot_uid:
+            if (
+                self._slack_thread_is_mention_only(
+                    channel_id,
+                    mention_only_thread_ts,
+                )
+                and not explicitly_mentioned
+            ):
+                logger.debug(
+                    "[Slack] Ignoring unmentioned message in mention-only thread %s/%s",
+                    channel_id,
+                    mention_only_thread_ts,
+                )
+                return
+
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
@@ -3007,7 +3035,11 @@ class SlackAdapter(BasePlatformAdapter):
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
             # defeat the feature (and re-enable agent-to-agent ack loops).
-            if event_thread_ts and not self._slack_strict_mention():
+            if (
+                event_thread_ts
+                and not self._slack_strict_mention()
+                and not self._slack_thread_is_mention_only(channel_id, event_thread_ts)
+            ):
                 self._mentioned_threads.add(event_thread_ts)
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
                     to_remove = list(self._mentioned_threads)[
@@ -4389,6 +4421,12 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return False
 
+    def _slack_thread_is_mention_only(
+        self, channel_id: str, thread_ts: Optional[str]
+    ) -> bool:
+        """Return whether ingress must require an explicit Slack mention."""
+        return get_thread_response_mode(channel_id, thread_ts) == "mention_only"
+
     def _slack_require_mention(self) -> bool:
         """Return whether channel messages require an explicit bot mention.
 
@@ -4775,6 +4813,17 @@ def _build_adapter(config):
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
+    # Older/test plugin contexts may only implement platform registration.
+    # Real PluginContext instances expose register_tool, making the response
+    # mode an agent-callable action instead of a transport phrase parser.
+    if hasattr(ctx, "register_tool"):
+        ctx.register_tool(
+            name="slack_thread_response_mode",
+            toolset="slack",
+            schema=SLACK_THREAD_RESPONSE_MODE_SCHEMA,
+            handler=_handle_slack_thread_response_mode,
+            emoji="🔕",
+        )
     ctx.register_platform(
         name="slack",
         label="Slack",
