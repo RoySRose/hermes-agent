@@ -12,6 +12,7 @@ import asyncio
 import json
 import threading
 import time
+import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -67,6 +68,12 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    # Must precede the dynamic /v1/runs/{run_id} entry below, mirroring
+    # production registration order in _http_route_table(): aiohttp's
+    # UrlDispatcher resolves routes in registration order, so a static
+    # "/v1/runs/meta" registered after the dynamic resource would be
+    # swallowed by it (run_id="meta") instead of reaching this handler.
+    app.router.add_get("/v1/runs/meta", adapter._handle_runs_meta)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -103,6 +110,30 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_total_tokens = 0
 
     return mock_agent, ready, interrupted
+
+
+def _seed_pending_approval(adapter: APIServerAdapter, run_id: str, **overrides):
+    """Register a real pending approval for run_id and mark the run as
+    waiting_for_approval, mirroring what an in-flight run's approval-request
+    callback does. Uses the real _ApprovalEntry/_publish_run_approval code
+    paths rather than hand-constructing internal state.
+
+    Returns the queued _ApprovalEntry. Callers that don't fully resolve the
+    approval must pop approval_mod._gateway_queues[run_id] themselves since
+    it's shared module-level state.
+    """
+    payload = {
+        "command": "bash -c pending-approval",
+        "description": "pending approval",
+        "pattern_keys": ["shell-c"],
+        **overrides,
+    }
+    entry = approval_mod._ApprovalEntry(payload)
+    adapter._run_approval_sessions[run_id] = run_id
+    with approval_mod._lock:
+        approval_mod._gateway_queues.setdefault(run_id, []).append(entry)
+    adapter._publish_run_approval(run_id, dict(entry.data))
+    return entry
 
 
 @pytest.fixture
@@ -638,3 +669,616 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+# ---------------------------------------------------------------------------
+# [local-patch] run-admission-idempotency — fingerprint / sweep / reserve
+# ---------------------------------------------------------------------------
+
+
+class TestRunAdmissionFingerprint:
+    def test_fingerprint_stable_for_identical_body(self, adapter):
+        body = {"input": "hello", "model": "gpt-5", "session_id": "s1"}
+        fp1 = adapter._run_admission_fingerprint(body, "gw-key")
+        fp2 = adapter._run_admission_fingerprint(dict(body), "gw-key")
+        assert fp1 == fp2
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "input",
+            "instructions",
+            "previous_response_id",
+            "conversation_history",
+            "session_id",
+            "model",
+        ],
+    )
+    def test_fingerprint_changes_when_semantic_field_changes(self, adapter, field):
+        base = {
+            "input": "hello",
+            "instructions": None,
+            "previous_response_id": None,
+            "conversation_history": None,
+            "session_id": "s1",
+            "model": "gpt-5",
+        }
+        baseline_fp = adapter._run_admission_fingerprint(base, "gw-key")
+        mutated = dict(base)
+        mutated[field] = "changed" if field != "conversation_history" else [{"role": "user", "content": "hi"}]
+        assert adapter._run_admission_fingerprint(mutated, "gw-key") != baseline_fp
+
+    def test_fingerprint_changes_with_gateway_session_key(self, adapter):
+        body = {"input": "hello"}
+        assert adapter._run_admission_fingerprint(body, "key-a") != adapter._run_admission_fingerprint(body, "key-b")
+        assert adapter._run_admission_fingerprint(body, None) != adapter._run_admission_fingerprint(body, "key-a")
+
+    def test_fingerprint_ignores_non_semantic_fields(self, adapter):
+        """Fields outside the fixed semantic set (e.g. request-tracing
+        metadata) must not perturb the fingerprint, or two functionally
+        identical retries would be treated as conflicting."""
+        body = {"input": "hello", "request_trace_id": "trace-1"}
+        other = {"input": "hello", "request_trace_id": "trace-2"}
+        assert adapter._run_admission_fingerprint(body, "k") == adapter._run_admission_fingerprint(other, "k")
+
+
+class TestRunAdmissionSweepAndReserve:
+    def test_reserve_records_entry_and_succeeds_under_capacity(self, adapter):
+        ok = adapter._reserve_run_admission("key-1", "fp-1", "run_1")
+        assert ok is True
+        entry = adapter._run_admissions["key-1"]
+        assert entry["fingerprint"] == "fp-1"
+        assert entry["run_id"] == "run_1"
+        assert entry["terminal"] is False
+        assert entry["response_status"] == "started"
+
+    def test_reserve_fails_closed_when_full_of_active_entries(self, adapter):
+        adapter._reserve_run_admission("key-1", "fp-1", "run_1")
+        adapter._MAX_RUN_ADMISSIONS = 1
+
+        ok = adapter._reserve_run_admission("key-2", "fp-2", "run_2")
+
+        assert ok is False
+        assert "key-2" not in adapter._run_admissions
+
+    def test_update_run_admission_status_marks_terminal_statuses(self, adapter):
+        adapter._reserve_run_admission("key-1", "fp-1", "run_1")
+
+        adapter._update_run_admission_status("run_1", "running")
+        assert adapter._run_admissions["key-1"]["terminal"] is False
+
+        adapter._update_run_admission_status("run_1", "completed")
+        assert adapter._run_admissions["key-1"]["terminal"] is True
+
+    def test_sweep_evicts_only_terminal_entries_past_ttl(self, adapter):
+        """Terminal admissions expire by TTL; still-active admissions never
+        do, regardless of age — evicting a live run's admission slot would
+        let a retried request race a second run into existence."""
+        adapter._reserve_run_admission("terminal-old", "fp-a", "run_a")
+        adapter._reserve_run_admission("terminal-fresh", "fp-b", "run_b")
+        adapter._reserve_run_admission("active-old", "fp-c", "run_c")
+        adapter._update_run_admission_status("run_a", "completed")
+        adapter._update_run_admission_status("run_b", "completed")
+
+        stale = time.time() - adapter._RUN_ADMISSION_TTL - 1
+        adapter._run_admissions["terminal-old"]["updated_at"] = stale
+        adapter._run_admissions["active-old"]["updated_at"] = stale
+        assert adapter._run_admissions["active-old"]["terminal"] is False
+
+        adapter._sweep_run_admissions()
+
+        assert "terminal-old" not in adapter._run_admissions
+        assert "terminal-fresh" in adapter._run_admissions
+        assert "active-old" in adapter._run_admissions
+
+    def test_reserve_recovers_capacity_after_sweeping_expired_terminal_entries(self, adapter):
+        adapter._reserve_run_admission("key-1", "fp-1", "run_1")
+        adapter._update_run_admission_status("run_1", "completed")
+        adapter._run_admissions["key-1"]["updated_at"] = time.time() - adapter._RUN_ADMISSION_TTL - 1
+        adapter._MAX_RUN_ADMISSIONS = 1
+
+        ok = adapter._reserve_run_admission("key-2", "fp-2", "run_2")
+
+        assert ok is True
+        assert "key-1" not in adapter._run_admissions
+        assert "key-2" in adapter._run_admissions
+
+
+# ---------------------------------------------------------------------------
+# [local-patch] approval-admission-idempotency — fingerprint / sweep / reserve
+# ---------------------------------------------------------------------------
+
+
+class TestApprovalAdmissionFingerprint:
+    def test_fingerprint_stable_for_identical_inputs(self, adapter):
+        fp1 = adapter._approval_admission_fingerprint("run_1", "once", False, "appr_1")
+        fp2 = adapter._approval_admission_fingerprint("run_1", "once", False, "appr_1")
+        assert fp1 == fp2
+
+    def test_fingerprint_changes_with_choice(self, adapter):
+        fp1 = adapter._approval_admission_fingerprint("run_1", "once", False, "appr_1")
+        fp2 = adapter._approval_admission_fingerprint("run_1", "deny", False, "appr_1")
+        assert fp1 != fp2
+
+    def test_fingerprint_changes_with_resolve_all(self, adapter):
+        fp1 = adapter._approval_admission_fingerprint("run_1", "once", False, "appr_1")
+        fp2 = adapter._approval_admission_fingerprint("run_1", "once", True, "appr_1")
+        assert fp1 != fp2
+
+    def test_fingerprint_changes_with_approval_id(self, adapter):
+        fp1 = adapter._approval_admission_fingerprint("run_1", "once", False, "appr_1")
+        fp2 = adapter._approval_admission_fingerprint("run_1", "once", False, "appr_2")
+        assert fp1 != fp2
+
+    def test_fingerprint_coerces_resolve_all_truthiness(self, adapter):
+        """resolve_all is cast with bool(...) before hashing, so any truthy
+        non-bool value must fingerprint identically to True."""
+        fp_bool = adapter._approval_admission_fingerprint("run_1", "once", True, "appr_1")
+        fp_truthy = adapter._approval_admission_fingerprint("run_1", "once", 1, "appr_1")
+        assert fp_bool == fp_truthy
+
+
+class TestApprovalAdmissionSweepAndReserve:
+    def test_reserve_records_entry_and_succeeds_under_capacity(self, adapter):
+        ok = adapter._reserve_approval_admission("key-1", "fp-1")
+        assert ok is True
+        assert adapter._approval_admissions["key-1"]["fingerprint"] == "fp-1"
+
+    def test_reserve_fails_closed_when_full(self, adapter):
+        adapter._reserve_approval_admission("key-1", "fp-1")
+        adapter._MAX_APPROVAL_ADMISSIONS = 1
+
+        ok = adapter._reserve_approval_admission("key-2", "fp-2")
+
+        assert ok is False
+        assert "key-2" not in adapter._approval_admissions
+
+    def test_sweep_evicts_purely_by_age_no_terminal_concept(self, adapter):
+        """Unlike run admissions, approval admissions have no terminal/active
+        distinction — an approval decision is one-shot, so age alone governs
+        eviction."""
+        adapter._reserve_approval_admission("key-old", "fp-old")
+        adapter._reserve_approval_admission("key-fresh", "fp-fresh")
+        adapter._approval_admissions["key-old"]["created_at"] = (
+            time.time() - adapter._RUN_ADMISSION_TTL - 1
+        )
+
+        adapter._sweep_approval_admissions()
+
+        assert "key-old" not in adapter._approval_admissions
+        assert "key-fresh" in adapter._approval_admissions
+
+    def test_reserve_recovers_capacity_after_sweeping_expired_entries(self, adapter):
+        adapter._reserve_approval_admission("key-1", "fp-1")
+        adapter._approval_admissions["key-1"]["created_at"] = (
+            time.time() - adapter._RUN_ADMISSION_TTL - 1
+        )
+        adapter._MAX_APPROVAL_ADMISSIONS = 1
+
+        ok = adapter._reserve_approval_admission("key-2", "fp-2")
+
+        assert ok is True
+        assert "key-1" not in adapter._approval_admissions
+        assert "key-2" in adapter._approval_admissions
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/runs/meta
+# ---------------------------------------------------------------------------
+
+
+class TestRunsMeta:
+    def test_meta_route_registered_before_dynamic_run_id_route(self, adapter):
+        """Regression test for the ordering invariant documented in
+        _http_route_table(): aiohttp resolves routes in registration order,
+        so a static /v1/runs/meta registered after the dynamic
+        /v1/runs/{run_id} GET route would never be reached (run_id="meta"
+        would match the dynamic route first)."""
+        routes = adapter._http_route_table()
+        get_run_paths = [
+            path for method, path, _handler in routes
+            if method == "GET" and path.startswith("/v1/runs")
+        ]
+        assert get_run_paths.index("/v1/runs/meta") < get_run_paths.index("/v1/runs/{run_id}")
+
+    @pytest.mark.asyncio
+    async def test_meta_returns_generation_and_idempotency_info(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/meta")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["server_generation"] == adapter._server_generation
+        assert data["idempotency"] == "v1"
+        assert data["idempotency_ttl_seconds"] == adapter._RUN_ADMISSION_TTL
+
+    @pytest.mark.asyncio
+    async def test_meta_rejects_unauthenticated_request(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/meta")
+
+        assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# X-Hermes-Expected-Generation
+# ---------------------------------------------------------------------------
+
+
+class TestExpectedGeneration:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_value", ["   ", "not-a-uuid", "x" * 65])
+    async def test_start_run_rejects_invalid_expected_generation(self, adapter, bad_value):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"X-Hermes-Expected-Generation": bad_value},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "X-Hermes-Expected-Generation is invalid"
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_run_rejects_mismatched_expected_generation(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"X-Hermes-Expected-Generation": str(uuid.uuid4())},
+                )
+                data = await resp.json()
+
+        assert resp.status == 409
+        assert data["error"]["code"] == "server_generation_mismatch"
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_run_accepts_matching_expected_generation(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"X-Hermes-Expected-Generation": adapter._server_generation},
+                )
+
+        assert resp.status == 202
+
+
+class TestApprovalExpectedGeneration:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_value", ["   ", "not-a-uuid", "x" * 65])
+    async def test_approval_rejects_invalid_expected_generation(self, adapter, bad_value):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_x/approval",
+                json={"choice": "once"},
+                headers={"X-Hermes-Expected-Generation": bad_value},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "X-Hermes-Expected-Generation is invalid"
+
+    @pytest.mark.asyncio
+    async def test_approval_rejects_mismatched_expected_generation(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_x/approval",
+                json={"choice": "once"},
+                headers={"X-Hermes-Expected-Generation": str(uuid.uuid4())},
+            )
+            data = await resp.json()
+
+        assert resp.status == 409
+        assert data["error"]["code"] == "server_generation_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Idempotency-Key header validation
+# ---------------------------------------------------------------------------
+
+
+class TestIdempotencyKeyValidation:
+    @pytest.mark.asyncio
+    async def test_start_run_rejects_empty_idempotency_key_header(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "   "},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "Idempotency-Key must be nonempty"
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_run_rejects_oversized_idempotency_key_header(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "k" * 257},
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "Idempotency-Key exceeds maximum length"
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_approval_rejects_empty_idempotency_key_header(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_x/approval",
+                json={"choice": "once"},
+                headers={"Idempotency-Key": "   "},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "Idempotency-Key must be nonempty"
+
+    @pytest.mark.asyncio
+    async def test_approval_rejects_oversized_idempotency_key_header(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_x/approval",
+                json={"choice": "once"},
+                headers={"Idempotency-Key": "k" * 257},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "Idempotency-Key exceeds maximum length"
+
+
+# ---------------------------------------------------------------------------
+# /v1/runs retry semantics + admission capacity
+# ---------------------------------------------------------------------------
+
+
+class TestRunIdempotentRetry:
+    @pytest.mark.asyncio
+    async def test_same_key_same_input_replay_does_not_create_second_run(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "retry-key-1"},
+                )
+                assert first.status == 202
+                run_id = (await first.json())["run_id"]
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                assert status["status"] == "completed"
+
+                second = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "retry-key-1"},
+                )
+                assert second.status == 202
+                second_data = await second.json()
+
+        assert second_data["run_id"] == run_id
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_same_key_different_input_returns_409(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "retry-key-2"},
+                )
+                assert first.status == 202
+
+                second = await cli.post(
+                    "/v1/runs",
+                    json={"input": "different input"},
+                    headers={"Idempotency-Key": "retry-key-2"},
+                )
+                data = await second.json()
+
+                for _ in range(20):
+                    if mock_create.call_count >= 1:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert second.status == 409
+        assert data["error"]["message"] == "Idempotency-Key was already used with different admission inputs"
+        assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_admission_registry_full_returns_503(self, adapter):
+        adapter._reserve_run_admission("filler-key", "filler-fp", "run_filler")
+        adapter._MAX_RUN_ADMISSIONS = 1
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "new-key"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 503
+        assert data["error"]["code"] == "run_admission_capacity"
+        mock_create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# [local-patch] approval-admission-idempotency — POST /v1/runs/{run_id}/approval
+# ---------------------------------------------------------------------------
+
+
+class TestApprovalIdempotency:
+    @pytest.mark.asyncio
+    async def test_approval_requires_approval_id_when_keyed(self, adapter):
+        """approval_id is optional for unkeyed (FIFO) requests, but a keyed
+        request must name the exact approval it resolves."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_x/approval",
+                json={"choice": "once"},
+                headers={"Idempotency-Key": "some-key"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "approval_id must be a nonempty string within the maximum length"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_approval_id", ["", "   ", "x" * 300])
+    async def test_approval_rejects_invalid_approval_id_value(self, adapter, bad_approval_id):
+        """The approval_id shape check fires unconditionally (with or
+        without an Idempotency-Key) whenever the field is present."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_x/approval",
+                json={"choice": "once", "approval_id": bad_approval_id},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["message"] == "approval_id must be a nonempty string within the maximum length"
+
+    @pytest.mark.asyncio
+    async def test_approval_keyed_request_cannot_resolve_all(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs/run_x/approval",
+                json={"choice": "once", "approval_id": "appr_1", "resolve_all": True},
+                headers={"Idempotency-Key": "some-key"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["code"] == "invalid_approval_resolution_scope"
+
+    @pytest.mark.asyncio
+    async def test_approval_id_mismatch_returns_409(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_mismatch_test"
+        _seed_pending_approval(adapter, run_id)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once", "approval_id": "not-the-pending-one"},
+                    headers={"Idempotency-Key": "mismatch-key"},
+                )
+                data = await resp.json()
+
+            assert resp.status == 409
+            assert data["error"]["code"] == "approval_id_mismatch"
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+
+    @pytest.mark.asyncio
+    async def test_approval_replay_returns_cached_response_without_reprocessing(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_replay_test"
+        entry = _seed_pending_approval(adapter, run_id)
+        real_approval_id = entry.approval_id
+        try:
+            with patch(
+                "tools.approval.resolve_gateway_approval_with_next",
+                wraps=approval_mod.resolve_gateway_approval_with_next,
+            ) as spy:
+                async with TestClient(TestServer(app)) as cli:
+                    body = {"choice": "once", "approval_id": real_approval_id}
+                    headers = {"Idempotency-Key": "approval-replay-key"}
+
+                    first = await cli.post(f"/v1/runs/{run_id}/approval", json=body, headers=headers)
+                    first_data = await first.json()
+                    assert first.status == 200
+                    assert first_data["resolved"] == 1
+
+                    second = await cli.post(f"/v1/runs/{run_id}/approval", json=body, headers=headers)
+                    second_data = await second.json()
+
+            assert second.status == 200
+            assert second_data == first_data
+            assert spy.call_count == 1
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+
+    @pytest.mark.asyncio
+    async def test_approval_rejected_when_admission_registry_full(self, adapter):
+        app = _create_runs_app(adapter)
+        run_id = "run_capacity_test"
+        entry = _seed_pending_approval(adapter, run_id)
+        adapter._reserve_approval_admission("filler-key", "filler-fp")
+        adapter._MAX_APPROVAL_ADMISSIONS = 1
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once", "approval_id": entry.approval_id},
+                    headers={"Idempotency-Key": "capacity-key"},
+                )
+                data = await resp.json()
+
+            assert resp.status == 503
+            assert data["error"]["code"] == "approval_admission_capacity"
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)

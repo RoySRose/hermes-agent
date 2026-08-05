@@ -1158,6 +1158,72 @@ class TestApprovalTimeoutIsNotConsent:
             else:
                 os.environ[k] = v
 
+    def test_resolver_preserves_fifo_and_all_without_approval_id(self):
+        from tools import approval as mod
+
+        first = mod._ApprovalEntry({"command": "first"})
+        second = mod._ApprovalEntry({"command": "second"})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [first, second]
+
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "once") == 1
+        assert first.result == "once"
+        assert first.event.is_set()
+        assert second.result is None
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "deny", resolve_all=True) == 1
+        assert second.result == "deny"
+        assert second.event.is_set()
+
+    def test_resolver_selects_exact_approval_id_and_rejects_duplicates(self):
+        from tools import approval as mod
+
+        first = mod._ApprovalEntry({"command": "first"})
+        second = mod._ApprovalEntry({"command": "second"})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [first, second]
+
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "deny", approval_id=second.approval_id,
+        ) == 1
+        assert first.result is None
+        assert second.result == "deny"
+        with mod._lock:
+            assert mod._gateway_queues[self.SESSION_KEY] == [first]
+
+        duplicate_a = mod._ApprovalEntry({"command": "duplicate-a"})
+        duplicate_b = mod._ApprovalEntry({"command": "duplicate-b"})
+        duplicate_b.approval_id = duplicate_a.approval_id
+        duplicate_b.data["approval_id"] = duplicate_a.approval_id
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [duplicate_a, duplicate_b]
+
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", approval_id=duplicate_a.approval_id,
+        ) == 0
+        assert not duplicate_a.event.is_set()
+        assert not duplicate_b.event.is_set()
+
+    def test_peek_and_atomic_resolution_return_shallow_next_head(self):
+        from tools import approval as mod
+
+        first = mod._ApprovalEntry({"command": "first", "nested": {"value": 1}})
+        second = mod._ApprovalEntry({"command": "second"})
+        with mod._lock:
+            mod._gateway_queues[self.SESSION_KEY] = [first, second]
+
+        peeked = mod.peek_gateway_approval(self.SESSION_KEY)
+        assert peeked == first.data
+        assert peeked is not first.data
+        resolved, next_approval = mod.resolve_gateway_approval_with_next(
+            self.SESSION_KEY, "deny", approval_id=first.approval_id,
+        )
+
+        assert resolved == 1
+        assert next_approval == second.data
+        assert next_approval is not second.data
+        assert first.event.is_set()
+        assert not second.event.is_set()
+
     def _force_short_timeout(self, monkeypatch, seconds=0.05):
         from tools import approval as mod
         monkeypatch.setattr(
