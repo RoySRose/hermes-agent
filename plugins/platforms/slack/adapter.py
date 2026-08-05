@@ -7456,6 +7456,8 @@ class SlackAdapter(BasePlatformAdapter):
             if boundary >= 0:
                 ordered = ordered[boundary + 1 :]
 
+        from gateway.session import neutralize_untrusted_inline_text
+
         formatted: List[str] = []
         has_unverified = False
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
@@ -7466,7 +7468,15 @@ class SlackAdapter(BasePlatformAdapter):
             if self_bot_uid and msg_user == str(self_bot_uid):
                 continue
 
-            msg_text = str(msg.get("text") or "").strip()
+            # Every field below is attacker-controlled Slack content that gets
+            # replayed into the model's context on a later turn. Collapse it to
+            # a single inert line first: an embedded newline would otherwise let
+            # a thread participant forge a new "Name: ..." speaker line, a fake
+            # section heading, or the "[End of recovered Slack context]" sentinel
+            # and escape the context-only block this function wraps them in.
+            msg_text = neutralize_untrusted_inline_text(
+                str(msg.get("text") or "").strip(), max_chars=0
+            )
             if bot_uid:
                 msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
 
@@ -7480,7 +7490,10 @@ class SlackAdapter(BasePlatformAdapter):
                     or file_obj.get("id")
                     or "attachment"
                 )
-                mimetype = str(file_obj.get("mimetype") or "").strip()
+                label = neutralize_untrusted_inline_text(label, max_chars=120)
+                mimetype = neutralize_untrusted_inline_text(
+                    str(file_obj.get("mimetype") or "").strip(), max_chars=80
+                )
                 attachments.append(f"{label} ({mimetype})" if mimetype else label)
             if attachments:
                 attachment_text = ", ".join(attachments)
@@ -7500,7 +7513,10 @@ class SlackAdapter(BasePlatformAdapter):
                 display_user = str(msg.get("username") or "bot")
             else:
                 display_user = "unknown"
-            name = await self._resolve_user_name(display_user, chat_id=channel_id)
+            name = neutralize_untrusted_inline_text(
+                await self._resolve_user_name(display_user, chat_id=channel_id),
+                max_chars=120,
+            )
             if is_bot:
                 name = f"{name} [bot]"
 
