@@ -314,12 +314,12 @@ class TestOpenRouterProfile:
 
         Covers the full real config range produced by
         ``hermes_constants.parse_reasoning_effort`` —
-        ``VALID_REASONING_EFFORTS = (minimal, low, medium, high, xhigh)``.
+        ``VALID_REASONING_EFFORTS = (minimal, low, medium, high, xhigh, max)``.
         """
         p = get_provider_profile("openrouter")
         model = "anthropic/claude-fable-5"
         assert self._is_mandatory(model)  # fixture really is mandatory
-        for effort in ("minimal", "low", "medium", "high", "xhigh"):
+        for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
             eb, tl = p.build_api_kwargs_extras(
                 reasoning_config={"enabled": True, "effort": effort},
                 supports_reasoning=True,
