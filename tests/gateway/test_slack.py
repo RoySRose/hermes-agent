@@ -21,6 +21,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SUPPORTED_VIDEO_TYPES,
     is_host_excluded_by_no_proxy,
 )
@@ -1316,17 +1317,30 @@ class TestBangPrefixCommands:
         assert msg_event.message_type == MessageType.COMMAND
 
 class TestFreeResponseBotMessages:
-    def _make_bot_event(self, *, channel="C_VOC", bot_user_id="U_SERVICE", text="<!subteam^S09AKCDF1DF> Room ID: *93* 환불해주세요"):
-        return {
+    def _make_bot_event(
+        self,
+        *,
+        channel="C_VOC",
+        bot_user_id="U_SERVICE",
+        bot_name="re",
+        text="<!subteam^S09AKCDF1DF> Room ID: *93* 환불해주세요",
+        ts="1234567890.000099",
+        thread_ts=None,
+    ):
+        event = {
             "text": text,
             "bot_id": "B_SERVICE",
             "subtype": "bot_message",
-            "bot_profile": {"user_id": bot_user_id, "name": "re"},
+            "username": bot_name,
+            "bot_profile": {"user_id": bot_user_id, "name": bot_name},
             "channel": channel,
             "channel_type": "channel",
             "team": "T_TEAM",
-            "ts": "1234567890.000099",
+            "ts": ts,
         }
+        if thread_ts:
+            event["thread_ts"] = thread_ts
+        return event
 
     @pytest.mark.asyncio
     async def test_free_response_channel_can_accept_service_bot_message(self, adapter):
@@ -1358,6 +1372,62 @@ class TestFreeResponseBotMessages:
         await adapter._handle_slack_message(self._make_bot_event())
 
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_excluded_batch_admin_bot_does_not_trigger_but_reaches_next_turn_context(
+        self, adapter
+    ):
+        thread_ts = "1234567890.000001"
+        adapter.config.extra["allow_bots"] = "mentions"
+        adapter.config.extra["excluded_trigger_bots"] = ["batch(admin)"]
+        adapter.config.extra["reactions"] = False
+
+        await adapter._handle_slack_message(
+            self._make_bot_event(
+                bot_name="batch(admin)",
+                text="<@U_BOT> 배치 점검 결과를 확인해 주세요",
+                ts="1234567890.000010",
+                thread_ts=thread_ts,
+            )
+        )
+
+        adapter.handle_message.assert_not_called()
+
+        human_event = {
+            "text": "<@U_BOT> 위 알림까지 보고 정리해줘",
+            "user": "U_USER",
+            "channel": "C_VOC",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+            "ts": "1234567890.000020",
+            "thread_ts": thread_ts,
+        }
+        with (
+            patch.object(adapter, "_has_active_session_for_thread", return_value=True),
+            patch.object(
+                adapter,
+                "_fetch_thread_parent_text",
+                new=AsyncMock(return_value="배치 점검 스레드"),
+            ),
+            patch.object(
+                adapter,
+                "_resolve_user_name",
+                new=AsyncMock(return_value="tester"),
+            ),
+        ):
+            await adapter._handle_slack_message(human_event)
+
+        adapter.handle_message.assert_awaited_once()
+        message_event = adapter.handle_message.await_args.args[0]
+        assert "batch(admin) [bot]: 배치 점검 결과를 확인해 주세요" in (
+            message_event.channel_context or ""
+        )
+
+        await adapter.on_processing_complete(
+            message_event,
+            ProcessingOutcome.SUCCESS,
+        )
+        assert adapter._pending_excluded_bot_context == {}
 
 
 class TestFreeResponseThreadMentions:
