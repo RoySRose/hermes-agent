@@ -14,6 +14,7 @@ import os
 import tempfile
 import threading
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,7 +26,7 @@ from utils import atomic_replace
 logger = logging.getLogger(__name__)
 
 _STATE_LOCK = threading.RLock()
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 _MODE_MENTION_ONLY = "mention_only"
 _MODE_NORMAL = "normal"
 _VALID_MODES = {_MODE_MENTION_ONLY, _MODE_NORMAL}
@@ -102,6 +103,77 @@ def get_thread_response_mode(channel_id: str, thread_ts: Optional[str]) -> str:
     return mode if mode in _VALID_MODES else _MODE_NORMAL
 
 
+def get_thread_response_state(
+    channel_id: str,
+    thread_ts: Optional[str],
+) -> dict[str, Any]:
+    """Return normalized persistent state for one Slack thread."""
+    default = {"mode": _MODE_NORMAL, "last_ingested_ts": None}
+    if not channel_id or not thread_ts:
+        return default
+    key = _thread_key(channel_id, str(thread_ts))
+    path = _state_path()
+    with _STATE_LOCK:
+        payload = _load_state_unlocked(path)
+        entry = payload["threads"].get(key)
+    if not isinstance(entry, dict):
+        return default
+    mode = str(entry.get("mode") or _MODE_NORMAL)
+    if mode not in _VALID_MODES:
+        mode = _MODE_NORMAL
+    cursor = entry.get("last_ingested_ts")
+    return {
+        "mode": mode,
+        "last_ingested_ts": str(cursor) if cursor else None,
+    }
+
+
+def _slack_ts_decimal(value: str) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid Slack message timestamp: {value!r}") from exc
+
+
+def advance_thread_history_cursor(
+    channel_id: str,
+    thread_ts: str,
+    message_ts: str,
+) -> bool:
+    """Advance a mention-only thread's ingested-history cursor monotonically.
+
+    Normal-mode or missing entries are left untouched so a disable performed
+    during the turn cannot be undone by the processing-complete callback.
+    """
+    if not channel_id or not thread_ts:
+        raise ValueError("Slack channel_id and thread_ts are required")
+    candidate = str(message_ts or "").strip()
+    candidate_value = _slack_ts_decimal(candidate)
+
+    path = _state_path()
+    key = _thread_key(channel_id, thread_ts)
+    with _STATE_LOCK:
+        payload = _load_state_unlocked(path)
+        entry = payload["threads"].get(key)
+        if not isinstance(entry, dict) or entry.get("mode") != _MODE_MENTION_ONLY:
+            return False
+        current = entry.get("last_ingested_ts")
+        if current:
+            try:
+                if _slack_ts_decimal(str(current)) >= candidate_value:
+                    return False
+            except ValueError:
+                logger.warning(
+                    "[Slack] Replacing invalid persisted history cursor for %s:%s",
+                    channel_id,
+                    thread_ts,
+                )
+        entry["last_ingested_ts"] = candidate
+        entry["cursor_updated_at"] = datetime.now(timezone.utc).isoformat()
+        _write_state_unlocked(path, payload)
+    return True
+
+
 def set_thread_response_mode(channel_id: str, thread_ts: str, mode: str) -> str:
     """Persist a response mode for one Slack channel thread."""
     normalized = str(mode or "").strip().lower()
@@ -118,12 +190,16 @@ def set_thread_response_mode(channel_id: str, thread_ts: str, mode: str) -> str:
         if normalized == _MODE_NORMAL:
             threads.pop(key, None)
         else:
-            threads[key] = {
+            previous = threads.get(key)
+            entry = {
                 "channel_id": str(channel_id),
                 "thread_ts": str(thread_ts),
                 "mode": normalized,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
+            if isinstance(previous, dict) and previous.get("last_ingested_ts"):
+                entry["last_ingested_ts"] = str(previous["last_ingested_ts"])
+            threads[key] = entry
         _write_state_unlocked(path, payload)
     return normalized
 
@@ -201,6 +277,8 @@ SLACK_THREAD_RESPONSE_MODE_SCHEMA = {
 __all__ = [
     "SLACK_THREAD_RESPONSE_MODE_SCHEMA",
     "_handle_slack_thread_response_mode",
+    "advance_thread_history_cursor",
     "get_thread_response_mode",
+    "get_thread_response_state",
     "set_thread_response_mode",
 ]
