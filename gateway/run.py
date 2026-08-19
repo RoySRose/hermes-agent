@@ -3602,6 +3602,38 @@ def _load_gateway_runtime_config() -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
+def _resolve_platform_agent_defaults(
+    platform: Optional["Platform"],
+    config: dict | None = None,
+) -> dict:
+    """Resolve optional model/reasoning defaults for one gateway platform.
+
+    Platform defaults live under ``platforms.<platform>`` and are applied only
+    when the session has no explicit ``/model`` or ``/reasoning`` override.
+    This keeps the profile-wide defaults as the fallback while allowing a
+    surface such as Slack to use a cheaper/faster model without splitting the
+    profile's memories, skills, or session store.
+    """
+    if platform is None:
+        return {}
+    cfg = config if isinstance(config, dict) else _load_gateway_runtime_config()
+    platforms = cfg.get("platforms", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(platforms, dict):
+        return {}
+    platform_cfg = platforms.get(_platform_config_key(platform), {})
+    if not isinstance(platform_cfg, dict):
+        return {}
+
+    defaults: dict[str, str] = {}
+    model = str(platform_cfg.get("model") or "").strip()
+    if model:
+        defaults["model"] = model
+    effort = str(platform_cfg.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        defaults["reasoning_effort"] = effort
+    return defaults
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -5278,6 +5310,26 @@ class TurnRunner:
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
+
+        async def _emit_commentary_delivery_hook(
+            delivered_text: str,
+            platform_message_id: Optional[str],
+        ) -> None:
+            await ctx._hooks_ref.emit("agent:commentary", {
+                "platform": ctx.source.platform.value if ctx.source.platform else "",
+                "user_id": ctx.source.user_id,
+                "chat_id": ctx.source.chat_id or "",
+                "thread_id": (
+                    str(getattr(ctx.source, "thread_id", None))
+                    if getattr(ctx.source, "thread_id", None) else ""
+                ),
+                "chat_type": getattr(ctx.source, "chat_type", "") or "",
+                "session_id": ctx.session_id,
+                "response": delivered_text,
+                "event_message_id": (
+                    str(platform_message_id) if platform_message_id is not None else ""
+                ),
+            })
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -5299,6 +5351,7 @@ class TurnRunner:
                             if ctx.progress_queue is not None
                             else None
                         ),
+                        on_commentary_delivered=_emit_commentary_delivery_hook,
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
@@ -5322,10 +5375,38 @@ class TurnRunner:
                 if ctx._run_still_current():
                     _stts_consumer_ref.on_delta(text)
 
-        def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+
+        def _interim_assistant_cb(
+            text: str,
+            *,
+            already_streamed: bool = False,
+            kind: str = "commentary",
+        ) -> None:
             if not ctx._run_still_current():
                 return
             display_text = text
+            # [local-patch] reasoning-summary-consumer-gate
+            # Codex reasoning summaries are scratch text, not deliberate
+            # commentary.  Chat surfaces only relay them when the platform's
+            # show_reasoning is on; the /v1/runs consumer keeps its own policy.
+            if kind == "reasoning_summary":
+                try:
+                    _summary_visible = _resolve_gateway_display_bool(
+                        _load_gateway_config(),
+                        _platform_config_key(ctx.source.platform),
+                        "show_reasoning",
+                        default=bool(getattr(self._runner, "_show_reasoning", False)),
+                        platform=ctx.source.platform,
+                        require_platform_override_for={Platform.MATTERMOST},
+                    )
+                except Exception:
+                    _summary_visible = (
+                        False
+                        if ctx.source.platform == Platform.MATTERMOST
+                        else bool(getattr(self._runner, "_show_reasoning", False))
+                    )
+                if not _summary_visible:
+                    return
             if _stream_consumer is not None:
                 if already_streamed:
                     _stream_consumer.on_segment_break()
@@ -5334,7 +5415,7 @@ class TurnRunner:
                 return
             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
                 return
-            safe_schedule_threadsafe(
+            _commentary_fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
@@ -5344,6 +5425,29 @@ class TurnRunner:
                 logger=logger,
                 log_message="interim_assistant_callback scheduling error",
             )
+            if _commentary_fut is None:
+                return
+
+            # Only emit the agent:commentary hook once the platform has
+            # confirmed delivery — hook consumers (logging/audit mirrors)
+            # need the exact text the user actually saw, not every
+            # attempted send.
+            def _emit_commentary_hook_on_delivery(fut, _text=display_text) -> None:
+                try:
+                    res = fut.result()
+                except Exception:
+                    return
+                if not getattr(res, "success", False):
+                    return
+                safe_schedule_threadsafe(
+                    _emit_commentary_delivery_hook(
+                        _text, getattr(res, "message_id", None)
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="agent:commentary hook scheduling error",
+                )
+            _commentary_fut.add_done_callback(_emit_commentary_hook_on_delivery)
 
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
@@ -19898,7 +20002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "message": message_text,
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -20151,7 +20255,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
-                "response": (response or "")[:500],
+                "response": response or "",
                 "model": agent_result.get("model", ""),
                 "provider": agent_result.get("provider", ""),
             })
@@ -24686,6 +24790,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        evt_type = evt.get("type", "")
+        if (
+            evt_type in {"watch_match", "watch_disabled"}
+            and self._load_background_notifications_mode() == "off"
+        ):
+            logger.debug(
+                "Suppressing watch notification because background notifications are off: %s",
+                evt.get("session_id", "unknown"),
+            )
+            return None
+
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -25507,9 +25622,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
 
-        if notify_mode == "off" and not agent_notify:
-            # Still wait for the process to exit so we can log it, but don't
-            # push any messages to the user.
+        if notify_mode == "off":
+            # The profile-level operator setting is authoritative, including
+            # over per-call notify_on_complete requests. Still wait for exit so
+            # lifecycle logging and watcher cleanup remain intact.
             while True:
                 await asyncio.sleep(interval)
                 session = process_registry.get(session_id)

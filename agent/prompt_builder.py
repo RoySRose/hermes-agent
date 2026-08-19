@@ -2292,10 +2292,118 @@ def load_soul_md(
         return None
 
 
-def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _normalize_context_file_path(path_value: str) -> Path:
+    """Expand a configured context path without reading or mutating it."""
+    return Path(os.path.expandvars(path_value)).expanduser().resolve()
+
+
+def _is_excluded_context_path(
+    path: Path,
+    excluded_paths: Optional[set[Path]] = None,
+) -> bool:
+    if not excluded_paths:
+        return False
+    try:
+        return path.resolve() in excluded_paths
+    except OSError:
+        return False
+
+
+def _configured_context_block() -> dict:
+    """Return ``config.yaml``'s optional ``context`` section."""
+    try:
+        from hermes_cli.config import load_config
+
+        context = load_config().get("context")
+    except Exception as e:
+        logger.debug("Could not read context config: %s", e)
+        return {}
+    return context if isinstance(context, dict) else {}
+
+
+def _iter_external_context_file_specs(config: dict) -> list[tuple[Path, str]]:
+    """Normalize ``context.external_files`` entries into ``(path, label)`` pairs.
+
+    Supported forms:
+      - ``/absolute/path.md``
+      - ``{path: /absolute/path.md, label: Human label}``
+    Invalid entries are ignored so a bad optional context file cannot break
+    prompt assembly for the whole agent.
+    """
+    raw_files = config.get("external_files")
+    if not isinstance(raw_files, list):
+        return []
+
+    specs: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for item in raw_files:
+        label = ""
+        path_value = None
+        if isinstance(item, str):
+            path_value = item
+        elif isinstance(item, dict):
+            path_value = item.get("path")
+            raw_label = item.get("label")
+            if isinstance(raw_label, str):
+                label = raw_label.strip()
+        if not isinstance(path_value, str) or not path_value.strip():
+            continue
+        path = _normalize_context_file_path(path_value.strip())
+        if path in seen:
+            continue
+        seen.add(path)
+        specs.append((path, label or str(path)))
+    return specs
+
+
+def _load_external_context_files(
+    context_length: Optional[int] = None,
+) -> tuple[str, set[Path]]:
+    """Load configured context.external_files in declaration order.
+
+    Returns a prompt section plus the resolved paths that were successfully
+    loaded so automatic project-context discovery can avoid duplicating them.
+    """
+    sections: list[str] = []
+    loaded_paths: set[Path] = set()
+    config = _configured_context_block()
+    for path, label in _iter_external_context_file_specs(config):
+        if not path.is_file():
+            logger.debug("Configured context external file does not exist: %s", path)
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            logger.debug("Could not read configured context external file %s: %s", path, e)
+            continue
+        if not content:
+            continue
+        content = _scan_context_content(content, label)
+        result = f"## {label}\n\nSource: {path}\n\n{content}"
+        sections.append(
+            _truncate_content(
+                result,
+                label,
+                context_length=context_length,
+                read_path=str(path),
+            )
+        )
+        loaded_paths.add(path)
+    return "\n".join(sections), loaded_paths
+
+
+def _context_ignores_hermes_md() -> bool:
+    return _configured_context_block().get("ignore_hermes_md") is True
+
+
+def _load_hermes_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    excluded_paths: Optional[set[Path]] = None,
+) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
-    if not hermes_md_path:
+    if not hermes_md_path or _is_excluded_context_path(hermes_md_path, excluded_paths):
         return ""
     try:
         content = hermes_md_path.read_text(encoding="utf-8").strip()
@@ -2345,7 +2453,11 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
     return chain
 
 
-def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_agents_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    excluded_paths: Optional[set[Path]] = None,
+) -> str:
     """AGENTS.md — merged directory chain from git root down to cwd.
 
     Each directory on the chain (see ``_agents_md_directory_chain``)
@@ -2365,7 +2477,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     for directory in _agents_md_directory_chain(cwd_resolved):
         for name in ["AGENTS.override.md", "AGENTS.md", "agents.md"]:
             candidate = directory / name
-            if not candidate.exists():
+            if not candidate.exists() or _is_excluded_context_path(candidate, excluded_paths):
                 continue
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
@@ -2403,11 +2515,15 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     )
 
 
-def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+def _load_claude_md(
+    cwd_path: Path,
+    context_length: Optional[int] = None,
+    excluded_paths: Optional[set[Path]] = None,
+) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
-        if candidate.exists():
+        if candidate.exists() and not _is_excluded_context_path(candidate, excluded_paths):
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
@@ -2489,6 +2605,12 @@ def build_context_files_prompt(
     cwd_path = Path(cwd).resolve()
     sections = []
 
+    # Configured external context is additive and precedes automatic discovery.
+    # Exclude successfully loaded paths from discovery to avoid duplicated roots.
+    external_context, external_paths = _load_external_context_files(context_length)
+    if external_context:
+        sections.append(external_context)
+
     # Never let a FALLBACK-picked directory inside the Hermes install/source
     # tree gain system-prompt authority. A backend that self-spawns into that
     # tree (the desktop app default) would otherwise load this repo's
@@ -2514,9 +2636,9 @@ def build_context_files_prompt(
     else:
         # Priority-based project context: first match wins
         project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
+            ("" if _context_ignores_hermes_md() else _load_hermes_md(cwd_path, context_length, external_paths))
+            or _load_agents_md(cwd_path, context_length, external_paths)
+            or _load_claude_md(cwd_path, context_length, external_paths)
             or _load_cursorrules(cwd_path, context_length)
         )
     if project_context:

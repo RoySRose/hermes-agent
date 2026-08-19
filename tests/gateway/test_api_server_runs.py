@@ -26,6 +26,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +404,151 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_events_stream_emits_completed_interim_messages(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                callback = kwargs["interim_assistant_callback"]
+                agent = MagicMock()
+                agent._strip_think_blocks.side_effect = lambda text: text.replace(
+                    "<think>private</think>", ""
+                )
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+
+                def run_conversation(**_run_kwargs):
+                    callback("<think>private</think>실제 중간 진행", already_streamed=True)
+                    callback("두 번째 진행")
+                    return {"final_response": "최종 답변"}
+
+                agent.run_conversation.side_effect = run_conversation
+                agent.session_prompt_tokens = 10
+                agent.session_completion_tokens = 5
+                agent.session_total_tokens = 15
+                return agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        interim = [event for event in events if event.get("event") == "assistant.interim.completed"]
+        assert [event["event_id"] for event in interim] == [
+            f"{run_id}:interim:0",
+            f"{run_id}:interim:1",
+        ]
+        assert [event["content"] for event in interim] == ["실제 중간 진행", "두 번째 진행"]
+        assert [event["kind"] for event in interim] == ["commentary", "commentary"]
+        assert all(
+            not ({"reasoning", "args", "preview", "result", "output", "usage"} & event.keys())
+            for event in interim
+        )
+        assert any(event.get("event") == "run.completed" and event.get("output") == "최종 답변" for event in events)
+
+    @pytest.mark.asyncio
+    async def test_events_stream_emits_reasoning_summary_interim_with_kind(self, adapter):
+        """Hive shows process: reasoning-summary interim still reaches the queue,
+        tagged so the UI can render it differently from real commentary."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                callback = kwargs["interim_assistant_callback"]
+                agent = MagicMock()
+                agent._strip_think_blocks.side_effect = lambda text: text
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+
+                def run_conversation(**_run_kwargs):
+                    callback("Checking the repository now.", kind="reasoning_summary")
+                    callback("실제 중간 진행", kind="commentary")
+                    return {"final_response": "최종 답변"}
+
+                agent.run_conversation.side_effect = run_conversation
+                agent.session_prompt_tokens = 0
+                agent.session_completion_tokens = 0
+                agent.session_total_tokens = 0
+                return agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        interim = [event for event in events if event.get("event") == "assistant.interim.completed"]
+        assert [(event["content"], event["kind"]) for event in interim] == [
+            ("Checking the repository now.", "reasoning_summary"),
+            ("실제 중간 진행", "commentary"),
+        ]
+
+    def test_run_event_callback_exposes_only_skill_view_name(self, adapter):
+        run_id = "run_skill"
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._set_run_status(run_id, "running")
+        loop = asyncio.new_event_loop()
+        callback = adapter._make_run_event_callback(run_id, loop)
+
+        callback(
+            "tool.started",
+            "skill_view",
+            "/private/SKILL.md",
+            {"name": "contract-first-qa", "token": "secret"},
+        )
+        loop.run_until_complete(asyncio.sleep(0))
+        event = loop.run_until_complete(queue.get())
+        loop.close()
+
+        assert event["tool"] == "skill_view"
+        assert event["skill_name"] == "contract-first-qa"
+        assert event["event_id"].startswith(f"{run_id}:skill:")
+        assert "args" not in event
+        assert "preview" not in event
+        assert "secret" not in json.dumps(event)
+        assert "/private" not in json.dumps(event)
+
+    @pytest.mark.asyncio
+    async def test_events_stream_suppresses_housekeeping_final_candidate(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                callback = kwargs["interim_assistant_callback"]
+                agent = MagicMock()
+                agent._strip_think_blocks.side_effect = lambda text: text
+                agent._last_content_with_tools = "final answer"
+                agent._last_content_tools_all_housekeeping = True
+
+                def run_conversation(**_run_kwargs):
+                    callback("final answer")
+                    return {"final_response": "final answer"}
+
+                agent.run_conversation.side_effect = run_conversation
+                agent.session_prompt_tokens = 0
+                agent.session_completion_tokens = 0
+                agent.session_total_tokens = 0
+                return agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert "assistant.interim.completed" not in body
+        assert "final answer" in body
 
 
 # ---------------------------------------------------------------------------
@@ -800,3 +946,112 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+async def _wait_for_completion(cli, run_id, tries=40):
+    status = None
+    for _ in range(tries):
+        status_resp = await cli.get(f"/v1/runs/{run_id}")
+        status = await status_resp.json()
+        if status["status"] in {"completed", "failed"}:
+            return status
+        await asyncio.sleep(0.05)
+    return status
+
+
+class TestRunSessionHistoryLoad:
+    @pytest.mark.asyncio
+    async def test_loads_persisted_history_when_only_session_id(self, adapter):
+        app = _create_runs_app(adapter)
+        prior = [
+            {"role": "user", "content": "첫 턴 질문"},
+            {"role": "assistant", "content": "첫 턴 답변"},
+        ]
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, \
+                 patch.object(
+                     adapter,
+                     "_conversation_history_for_session",
+                     return_value=prior,
+                 ) as mock_hist:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "둘째 턴", "session_id": "hub-selftest"},
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                status = await _wait_for_completion(cli, data["run_id"])
+
+        assert status["status"] == "completed"
+        # The persisted session was consulted with the client's session_id ...
+        mock_hist.assert_called_once_with("hub-selftest")
+        # ... and its result was handed to the agent as prior context.
+        assert (
+            mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+            == prior
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_history_takes_precedence_over_session_load(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, \
+                 patch.object(
+                     adapter, "_conversation_history_for_session"
+                 ) as mock_hist:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "둘째 턴",
+                        "session_id": "hub-selftest",
+                        "conversation_history": [
+                            {"role": "user", "content": "explicit prior"}
+                        ],
+                    },
+                )
+                assert resp.status == 202
+                data = await resp.json()
+                status = await _wait_for_completion(cli, data["run_id"])
+
+        assert status["status"] == "completed"
+        # Explicit body history wins; the session store is never consulted.
+        mock_hist.assert_not_called()
+        passed = mock_agent.run_conversation.call_args.kwargs["conversation_history"]
+        assert passed == [{"role": "user", "content": "explicit prior"}]
+
+    @pytest.mark.asyncio
+    async def test_no_session_id_does_not_consult_session_store(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, \
+                 patch.object(
+                     adapter, "_conversation_history_for_session"
+                 ) as mock_hist:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "ok"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "no session"})
+                assert resp.status == 202
+                data = await resp.json()
+                status = await _wait_for_completion(cli, data["run_id"])
+
+        assert status["status"] == "completed"
+        mock_hist.assert_not_called()

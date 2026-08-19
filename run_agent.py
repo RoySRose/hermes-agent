@@ -6676,7 +6676,10 @@ class AIAgent:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(
-        self, assistant_msg: Dict[str, Any]
+        self,
+        assistant_msg: Dict[str, Any],
+        *,
+        codex_reasoning_summary: Optional[str] = None,
     ) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
@@ -6708,11 +6711,27 @@ class AIAgent:
             if commentary_parts
             else self._interim_assistant_visible_text(assistant_msg)
         )
+        kind = "commentary"
+        if (
+            not visible
+            and self.api_mode == "codex_responses"
+            and bool(assistant_msg.get("tool_calls"))
+            and isinstance(codex_reasoning_summary, str)
+        ):
+            visible = self._strip_think_blocks(codex_reasoning_summary).strip()
+            if visible:
+                # Scratch summaries are opt-in at the consumer boundary.
+                kind = "reasoning_summary"
         if (
             not visible
             or visible == "(empty)"
             or self._interim_text_was_delivered(visible)
         ):
+            return
+        from agent.redact import redact_sensitive_text as _redact_interim
+
+        visible = _redact_interim(visible, force=True)
+        if not visible:
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:
@@ -6735,7 +6754,14 @@ class AIAgent:
         if cb is None:
             return
         try:
-            cb(visible, already_streamed=already_streamed)
+            try:
+                cb(visible, already_streamed=already_streamed, kind=kind)
+            except TypeError as exc:
+                # Preserve callbacks written before the optional kind keyword.
+                # Do not retry a TypeError raised inside the callback itself.
+                if exc.__traceback__ is not None and exc.__traceback__.tb_next is not None:
+                    raise
+                cb(visible, already_streamed=already_streamed)
             if undelivered_parts:
                 for part in undelivered_parts:
                     self._record_delivered_interim_text(part)

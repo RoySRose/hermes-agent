@@ -58,7 +58,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -988,7 +988,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key, X-Hermes-Expected-Generation",
 }
 
 
@@ -1432,6 +1432,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # [local-patch] run-admission-idempotency
+        # Process-local admission records deliberately retain only a digest and
+        # acceptance receipt, never request bodies. They are the idempotency
+        # boundary before asynchronous work is scheduled.
+        self._server_generation = str(uuid.uuid4())
+        self._run_admissions: Dict[str, Dict[str, Any]] = {}
+        # Approval decisions have their own receipt registry: a run admission
+        # receipt cannot safely stand in for a decision against a particular
+        # pending approval.
+        self._approval_admissions: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -2075,6 +2085,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/api/sessions/{session_id}/compress", self._handle_compress_session),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -2092,6 +2103,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            # Must precede the dynamic /v1/runs/{run_id} entry below: aiohttp's
+            # UrlDispatcher resolves routes in registration order, so a static
+            # "/v1/runs/meta" registered after the dynamic resource would be
+            # swallowed by it (run_id="meta") instead of reaching this handler.
+            ("GET", "/v1/runs/meta", self._handle_runs_meta),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -2643,6 +2659,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        interim_assistant_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -4096,6 +4113,167 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+    async def _handle_compress_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/compress — on-demand session compaction.
+
+        Mirrors the chat-platform ``/compress`` slash command
+        (``gateway/slash_commands.py::_handle_compress_command``) but acts on
+        a SessionDB-addressed session id instead of a gateway transcript, so
+        HTTP clients (the Hub compaction button) can trigger it without a
+        chat-platform session behind it. Optional JSON body:
+        ``{"focus": "<topic>", "keep_last": <int>}`` — ``keep_last`` N does a
+        boundary-aware partial compress (head summarized, most recent N
+        exchanges kept verbatim); otherwise a full compress with optional
+        ``focus``.
+        """
+        # Hub's compaction button (agent_context.request_hermes_compaction in
+        # the ecosystem hub-api repo) POSTs here with an empty body against
+        # the Hub-addressed session_id ("hub-<channel>"). api_server had no
+        # compaction surface before this endpoint (Hub's button 501'd).
+        # [local-patch] session-compress-endpoint
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        history = await self._conversation_history_for_session(session_id)
+        msgs = [
+            {"role": m.get("role"), "content": m.get("content")}
+            for m in history
+            if m.get("role") in {"user", "assistant"} and m.get("content")
+        ]
+        if not msgs:
+            return web.json_response(
+                _openai_error(f"Session not found or empty: {session_id}", code="session_not_found"),
+                status=404,
+            )
+
+        # Busy check: `_active_run_agents` is populated only by `_handle_runs`
+        # (the /v1/runs control surface the Hub bridge actually talks to —
+        # see the run-session-history-load patch above), so checking it
+        # reliably catches an in-flight Hub-originated turn on this
+        # session_id. It does NOT see a concurrent turn started via
+        # `_handle_session_chat` (/api/sessions/{id}/chat), which never
+        # populates this dict — that surface has no in-flight registry of
+        # its own today. Documented gap, not fixed here: closing it would
+        # need a general per-session busy registry no handler maintains yet.
+        for _active_agent in list(self._active_run_agents.values()):
+            if getattr(_active_agent, "session_id", None) == session_id:
+                return web.json_response(
+                    _openai_error(f"Run in progress for session: {session_id}", code="session_busy"),
+                    status=409,
+                )
+
+        focus_topic = body.get("focus")
+        if focus_topic is not None and not isinstance(focus_topic, str):
+            return web.json_response(_openai_error("focus must be a string", code="invalid_focus"), status=400)
+        raw_keep_last = body.get("keep_last")
+        partial = isinstance(raw_keep_last, int) and not isinstance(raw_keep_last, bool) and raw_keep_last > 0
+        keep_last = raw_keep_last if partial else 0
+
+        from hermes_cli.partial_compress import (
+            rejoin_compressed_head_and_tail,
+            split_history_for_partial_compress,
+        )
+
+        tail: list = []
+        head = msgs
+        if partial:
+            head, tail = split_history_for_partial_compress(msgs, keep_last)
+            if not tail:
+                # Degenerate split (not enough history) — fall back to full.
+                partial = False
+                head = msgs
+
+        loop = asyncio.get_running_loop()
+
+        def _run() -> Dict[str, Any]:
+            from gateway.session_context import clear_session_vars
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            tokens = self._bind_api_server_session(
+                chat_id=session_id,
+                session_key=session_id,
+                session_id=session_id,
+            )
+            try:
+                tmp_agent = self._create_agent(session_id=session_id)
+                tmp_agent._print_fn = lambda *a, **kw: None
+                # Throwaway compression agent — don't let disposal stamp an
+                # end_reason onto the (still live, Hub-owned) session row.
+                tmp_agent._end_session_on_close = False
+
+                _sys_prompt = getattr(tmp_agent, "_cached_system_prompt", "") or ""
+                _tools = getattr(tmp_agent, "tools", None) or None
+                approx_tokens = estimate_request_tokens_rough(
+                    msgs, system_prompt=_sys_prompt, tools=_tools
+                )
+
+                compressor = tmp_agent.context_compressor
+                if not compressor.has_content_to_compress(head):
+                    return {"noop": True}
+
+                compressed, _ = tmp_agent._compress_context(
+                    head, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True
+                )
+                if partial and tail:
+                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
+
+                rotated = getattr(tmp_agent, "session_id", session_id) != session_id
+                return {"noop": False, "compressed": compressed, "rotated": rotated}
+            finally:
+                clear_session_vars(tokens)
+
+        result = await loop.run_in_executor(None, _run)
+
+        if result.get("noop"):
+            return web.json_response({
+                "ok": True,
+                "session_id": session_id,
+                "messages_before": len(history),
+                "messages_after": len(history),
+            })
+
+        compressed = result["compressed"]
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+
+        # Persist to the ORIGINAL url-path session_id regardless of whether
+        # _compress_context rotated internally (legacy/default mode ends the
+        # old id and mints a fresh continuation id, writing nothing back to
+        # the id we were called with) or compacted in place (same id,
+        # already durably archived+replaced by archive_and_compact). The Hub
+        # bridge always addresses this exact literal session_id
+        # ("hub-<channel>") via /v1/runs and never follows session lineage,
+        # so an unconditional replace_messages() is what makes the
+        # compressed result visible on the next read regardless of which
+        # internal path fired. (Accepted trade-off: in in-place mode this
+        # second write supersedes archive_and_compact's own soft-archive of
+        # the pre-compaction rows with a hard replace — acceptable since
+        # compression.in_place defaults to off "during rollout" today, and
+        # this endpoint's contract is simply "replace the session's stored
+        # messages with the compressed history".)
+        await asyncio.to_thread(db.replace_messages, session_id, compressed)
+        if result["rotated"]:
+            # Rotation stamped ended_at/end_reason="compression" onto the
+            # ORIGINAL row (the id we still address) inside _compress_context.
+            # Reopen it so the still-in-use Hub session doesn't show as ended.
+            try:
+                await asyncio.to_thread(db.reopen_session, session_id)
+            except Exception:
+                logger.debug("reopen_session failed for %s after compress", session_id, exc_info=True)
+
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "messages_before": len(history),
+            "messages_after": len(compressed),
+        })
 
     async def _drain_session_stream_task_on_disconnect(
         self,
@@ -6561,6 +6739,103 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_ADMISSION_TTL = _RUN_STATUS_TTL
+    _MAX_RUN_ADMISSIONS = 1024
+    _MAX_APPROVAL_ADMISSIONS = 1024
+    _MAX_IDEMPOTENCY_KEY_LENGTH = 256
+    _MAX_EXPECTED_GENERATION_LENGTH = 64
+    _MAX_APPROVAL_ID_LENGTH = 256
+    _TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+    @staticmethod
+    def _run_admission_fingerprint(body: Dict[str, Any], gateway_session_key: Optional[str]) -> str:
+        """Digest every input that can change /v1/runs admission semantics."""
+        semantic = {
+            "input": body.get("input"),
+            "instructions": body.get("instructions"),
+            "previous_response_id": body.get("previous_response_id"),
+            "conversation_history": body.get("conversation_history"),
+            "session_id": body.get("session_id"),
+            "model": body.get("model"),
+            "gateway_session_key": gateway_session_key,
+        }
+        encoded = json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _sweep_run_admissions(self) -> None:
+        """Expire terminal receipts without ever dropping a live admission."""
+        now = time.time()
+        expired = [
+            key for key, entry in self._run_admissions.items()
+            if entry.get("terminal") and now - float(entry.get("updated_at", now)) > self._RUN_ADMISSION_TTL
+        ]
+        for key in expired:
+            self._run_admissions.pop(key, None)
+
+    def _reserve_run_admission(self, key: str, fingerprint: str, run_id: str) -> bool:
+        """Reserve bounded keyed admission before any async-visible run state.
+
+        Active and unexpired terminal records are never evicted; a full registry
+        fails closed until a terminal receipt has reached its advertised TTL.
+        This method runs synchronously on the aiohttp loop, so the reservation
+        precedes both status publication and task creation.
+        """
+        self._sweep_run_admissions()
+        if len(self._run_admissions) >= self._MAX_RUN_ADMISSIONS:
+            return False
+        now = time.time()
+        self._run_admissions[key] = {
+            "key": key,
+            "fingerprint": fingerprint,
+            "run_id": run_id,
+            "response_status": "started",
+            "terminal": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        return True
+
+    def _update_run_admission_status(self, run_id: str, status: str) -> None:
+        for entry in self._run_admissions.values():
+            if entry.get("run_id") == run_id:
+                entry["terminal"] = status in self._TERMINAL_RUN_STATUSES
+                entry["updated_at"] = time.time()
+                return
+
+    @staticmethod
+    def _approval_admission_fingerprint(
+        run_id: str, choice: str, resolve_all: bool, approval_id: Optional[str],
+    ) -> str:
+        """Digest every input that can change approval-decision admission semantics."""
+        semantic = {
+            "run_id": run_id,
+            "choice": choice,
+            "resolve_all": bool(resolve_all),
+            "approval_id": approval_id,
+        }
+        encoded = json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _sweep_approval_admissions(self) -> None:
+        """Drop only expired approval receipts; active receipts are never evicted."""
+        now = time.time()
+        expired = [
+            key for key, entry in self._approval_admissions.items()
+            if now - float(entry.get("created_at", now)) > self._RUN_ADMISSION_TTL
+        ]
+        for key in expired:
+            self._approval_admissions.pop(key, None)
+
+    def _reserve_approval_admission(self, key: str, fingerprint: str) -> bool:
+        """Reserve a bounded approval receipt immediately before resolution."""
+        self._sweep_approval_admissions()
+        if len(self._approval_admissions) >= self._MAX_APPROVAL_ADMISSIONS:
+            return False
+        self._approval_admissions[key] = {
+            "fingerprint": fingerprint,
+            "created_at": time.time(),
+        }
+        return True
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -6574,11 +6849,133 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
+        if status in self._TERMINAL_RUN_STATUSES:
+            # A terminal run can no longer have a live pending approval; drop
+            # any stale entry so polling clients don't see a phantom prompt.
+            current.pop("approval", None)
         self._run_statuses[run_id] = current
+        self._update_run_admission_status(run_id, status)
         return current
+
+    def _approval_request_event(
+        self, run_id: str, approval_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the public, redacted event for one core approval identity."""
+        event = dict(approval_data or {})
+        approval_id = event.get("approval_id")
+        if (
+            not isinstance(approval_id, str)
+            or not approval_id
+            or len(approval_id) > self._MAX_APPROVAL_ID_LENGTH
+        ):
+            raise ValueError("gateway approval notification has invalid approval_id")
+        # Redact credentials from the command before it enters the
+        # SSE/API event stream — same egress bug as #48456, second
+        # transport: API/desktop clients would otherwise receive the
+        # raw command Tirith flagged. Reuse the gateway seam.
+        if "command" in event:
+            from gateway.run import _redact_approval_command
+
+            event["command"] = _redact_approval_command(event.get("command"))
+        event.update({
+            "event": "approval.request",
+            "run_id": run_id,
+            "approval_id": approval_id,
+            "timestamp": time.time(),
+            "choices": _approval_event_choices(
+                smart_denied=bool(event.get("smart_denied")),
+                allow_permanent=event.get("allow_permanent") is not False,
+            ),
+        })
+        return event
+
+    def _publish_run_approval(
+        self,
+        run_id: str,
+        approval_data: Dict[str, Any],
+        *,
+        expected_head_id: Optional[str] = None,
+    ) -> bool:
+        """Publish a pending approval unless a newer head already owns status."""
+        event = self._approval_request_event(run_id, approval_data)
+        approval_id = event["approval_id"]
+        current = self._run_statuses.get(run_id, {})
+        current_approval = current.get("approval")
+        current_approval_id = (
+            current_approval.get("approval_id") if isinstance(current_approval, dict) else None
+        )
+        if expected_head_id is not None and current_approval_id not in {None, expected_head_id}:
+            return False
+        approval_status = {
+            key: value for key, value in event.items()
+            if key not in {"event", "run_id", "timestamp"}
+        }
+        self._set_run_status(
+            run_id,
+            "waiting_for_approval",
+            last_event="approval.request",
+            approval=approval_status,
+        )
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            q.put_nowait(event)
+        return True
+
+    @staticmethod
+    def _enqueue_run_event(
+        loop: "asyncio.AbstractEventLoop",
+        loop_thread_id: int,
+        put_fn: "Callable[[], None]",
+    ) -> None:
+        """Run ``put_fn`` on the event loop thread, preserving ordering across
+        the executor-thread/event-loop boundary.
+
+        Interim run events (tool progress, message deltas) are produced on
+        the executor thread that runs ``agent.run_conversation`` while the
+        event loop thread is otherwise free to run other coroutines.
+        ``call_soon_threadsafe`` only *schedules* ``put_fn``; it doesn't wait
+        for the loop to actually execute it. Once ``run_in_executor``
+        returns, the run coroutine resumes on the loop thread and enqueues
+        ``run.completed``/``run.failed`` and the closing ``None`` sentinel
+        directly via ``put_nowait`` on that same thread. A still-pending
+        scheduled ``put_fn`` for an interim event can lose that race and
+        land after ``run.completed``, or after the SSE consumer has already
+        seen the sentinel and stopped reading -- silently dropping the
+        interim event from the ``/v1/runs/{run_id}/events`` stream.
+        Observed on Python 3.13.
+
+        Blocking the calling (executor) thread here until the loop has
+        actually run ``put_fn`` closes that window: an interim callback
+        cannot return -- and therefore the executor thread cannot proceed
+        toward run completion -- until its event is durably queued ahead of
+        anything the loop thread does afterward. This is a synchronous
+        no-op passthrough when already called from the loop thread (avoids
+        a deadlock: the loop thread can't block waiting on itself).
+        """
+        if threading.get_ident() == loop_thread_id:
+            put_fn()
+            return
+        applied = threading.Event()
+
+        def _apply() -> None:
+            try:
+                put_fn()
+            finally:
+                applied.set()
+
+        try:
+            loop.call_soon_threadsafe(_apply)
+        except Exception:
+            return
+        # Bound the wait so loop shutdown/errors cannot strand the executor
+        # thread indefinitely.
+        applied.wait(timeout=2.0)
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        loop_thread_id = threading.get_ident()
+        skill_index = 0
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -6589,20 +6986,29 @@ class APIServerAdapter(BasePlatformAdapter):
             if q is None:
                 return
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                self._enqueue_run_event(loop, loop_thread_id, lambda: q.put_nowait(event))
             except Exception:
                 pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+            nonlocal skill_index
             ts = time.time()
             if event_type == "tool.started":
-                _push({
+                event = {
                     "event": "tool.started",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "preview": preview,
-                })
+                }
+                if tool_name == "skill_view" and isinstance(args, dict):
+                    skill_name = args.get("name")
+                    if isinstance(skill_name, str) and skill_name:
+                        event["skill_name"] = skill_name
+                        event["event_id"] = f"{run_id}:skill:{skill_index}"
+                        skill_index += 1
+                else:
+                    event["preview"] = preview
+                _push(event)
             elif event_type == "tool.completed":
                 _push({
                     "event": "tool.completed",
@@ -6678,12 +7084,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
-
         try:
             body = await request.json()
         except Exception:
@@ -6745,6 +7145,65 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        # Lowest-priority fallback for run-addressed clients.
+        # [local-patch] run-session-history-load
+        if not conversation_history and session_id:
+            conversation_history = await self._conversation_history_for_session(session_id)
+
+        # [local-patch] run-admission-idempotency
+        # Idempotency-Key lets a client safely retry a POST /v1/runs whose
+        # response was lost in transit without risking a duplicate run.
+        # X-Hermes-Expected-Generation lets a client detect a server restart
+        # (which invalidates its view of in-flight run state) before
+        # admitting a new run under stale assumptions.
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        expected_generation = request.headers.get("X-Hermes-Expected-Generation")
+        if expected_generation is not None:
+            expected_generation = expected_generation.strip()
+            if (
+                not expected_generation
+                or len(expected_generation) > self._MAX_EXPECTED_GENERATION_LENGTH
+            ):
+                return web.json_response(
+                    _openai_error("X-Hermes-Expected-Generation is invalid"), status=400,
+                )
+            try:
+                uuid.UUID(expected_generation)
+            except (TypeError, ValueError, AttributeError):
+                return web.json_response(
+                    _openai_error("X-Hermes-Expected-Generation is invalid"), status=400,
+                )
+            # This comparison shares the request's admission critical section
+            # with lookup/reservation below: no run state exists before it.
+            if not hmac.compare_digest(expected_generation, self._server_generation):
+                return web.json_response(
+                    _openai_error("Hermes server generation mismatch", code="server_generation_mismatch"),
+                    status=409,
+                )
+        if "Idempotency-Key" in request.headers and not idempotency_key:
+            return web.json_response(
+                _openai_error("Idempotency-Key must be nonempty"), status=400,
+            )
+        if len(idempotency_key) > self._MAX_IDEMPOTENCY_KEY_LENGTH:
+            return web.json_response(
+                _openai_error("Idempotency-Key exceeds maximum length"), status=400,
+            )
+        fingerprint = None
+        if idempotency_key:
+            fingerprint = self._run_admission_fingerprint(body, gateway_session_key)
+            self._sweep_run_admissions()
+            admission = self._run_admissions.get(idempotency_key)
+            if admission is not None:
+                if not hmac.compare_digest(str(admission["fingerprint"]), fingerprint):
+                    return web.json_response(
+                        _openai_error("Idempotency-Key was already used with different admission inputs"),
+                        status=409,
+                    )
+                return web.json_response(
+                    {"run_id": admission["run_id"], "status": admission["response_status"]},
+                    status=202,
+                )
+
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6757,7 +7216,20 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        # A replay is accepted above even if capacity has since filled. New
+        # admissions remain subject to the shared concurrency limit.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         run_id = f"run_{uuid.uuid4().hex}"
+        if idempotency_key and not self._reserve_run_admission(
+            idempotency_key, fingerprint, run_id,
+        ):
+            return web.json_response(
+                _openai_error("Run admission registry is full", code="run_admission_capacity"),
+                status=503,
+            )
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -6767,6 +7239,7 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
+        loop_thread_id = threading.get_ident()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
         self._run_streams[run_id] = q
@@ -6774,6 +7247,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_approval_sessions[run_id] = approval_session_key
 
         event_cb = self._make_run_event_callback(run_id, loop)
+        interim_sequence = 0
+        agent_ref: List[Any] = [None]
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
@@ -6786,13 +7261,64 @@ class APIServerAdapter(BasePlatformAdapter):
                 return
             if run_id not in self._run_streams:
                 return
+            event = {
+                "event": "message.delta",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "delta": delta,
+            }
             try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
+                self._enqueue_run_event(loop, loop_thread_id, lambda: _put_event_if_active(event))
+            except Exception:
+                pass
+
+        # [local-patch] run-interim-assistant-events
+        def _interim_assistant_cb(
+            text: str,
+            *,
+            already_streamed: bool = False,
+            kind: str = "commentary",
+        ) -> None:
+            """Expose only completed, visible interim assistant messages."""
+            nonlocal interim_sequence
+            agent = agent_ref[0]
+            if agent is None:
+                return
+            try:
+                visible = agent._strip_think_blocks(text or "").strip()
+            except Exception:
+                visible = str(text or "").strip()
+            if not visible:
+                return
+
+            # A content+housekeeping-tools turn may become the final answer when
+            # its follow-up is empty. Keep that candidate exclusively in
+            # run.completed instead of leaking it as interim commentary.
+            try:
+                last_content = agent._strip_think_blocks(
+                    getattr(agent, "_last_content_with_tools", "") or ""
+                ).strip()
+            except Exception:
+                last_content = str(getattr(agent, "_last_content_with_tools", "") or "").strip()
+            if (
+                getattr(agent, "_last_content_tools_all_housekeeping", False)
+                and visible == last_content
+            ):
+                return
+
+            event_id = f"{run_id}:interim:{interim_sequence}"
+            interim_sequence += 1
+            event = {
+                "event": "assistant.interim.completed",
+                "run_id": run_id,
+                "event_id": event_id,
+                "timestamp": time.time(),
+                "content": visible,
+                "kind": kind,
+            }
+            self._set_run_status(run_id, "running", last_event=event["event"])
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
             except Exception:
                 pass
 
@@ -6828,6 +7354,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
+                        interim_assistant_callback=_interim_assistant_cb,
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
@@ -6836,35 +7363,29 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                     )
                 self._active_run_agents[run_id] = agent
+                agent_ref[0] = agent
 
-                def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                    )
+                def _publish_approval_request(approval_data: Dict[str, Any]) -> None:
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        from tools.approval import peek_gateway_approval
+
+                        head = peek_gateway_approval(approval_session_key)
+                        if (
+                            not isinstance(head, dict)
+                            or head.get("approval_id") != approval_data.get("approval_id")
+                        ):
+                            return
+                        head_id = head["approval_id"]
+                        loop.call_soon_threadsafe(
+                            lambda: self._publish_run_approval(
+                                run_id, head, expected_head_id=head_id,
+                            ),
+                        )
                     except Exception:
                         pass
+
+                def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                    _publish_approval_request(approval_data)
 
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
@@ -7086,6 +7607,17 @@ class APIServerAdapter(BasePlatformAdapter):
             headers=response_headers,
         )
 
+    async def _handle_runs_meta(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs/meta — process generation for safe admission recovery."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({
+            "server_generation": self._server_generation,
+            "idempotency": "v1",
+            "idempotency_ttl_seconds": self._RUN_ADMISSION_TTL,
+        })
+
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
         auth_err = self._check_auth(request)
@@ -7160,13 +7692,6 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
-        if status is None:
-            return web.json_response(
-                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
-                status=404,
-            )
-
         try:
             body = await request.json()
         except Exception:
@@ -7185,6 +7710,110 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        # [local-patch] approval-admission-idempotency
+        # Mirrors the /v1/runs validation order: generation check, then
+        # Idempotency-Key shape, before anything touches run/approval state.
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        expected_generation = request.headers.get("X-Hermes-Expected-Generation")
+        if expected_generation is not None:
+            expected_generation = expected_generation.strip()
+            if (
+                not expected_generation
+                or len(expected_generation) > self._MAX_EXPECTED_GENERATION_LENGTH
+            ):
+                return web.json_response(
+                    _openai_error("X-Hermes-Expected-Generation is invalid"), status=400,
+                )
+            try:
+                uuid.UUID(expected_generation)
+            except (TypeError, ValueError, AttributeError):
+                return web.json_response(
+                    _openai_error("X-Hermes-Expected-Generation is invalid"), status=400,
+                )
+            if not hmac.compare_digest(expected_generation, self._server_generation):
+                return web.json_response(
+                    _openai_error("Hermes server generation mismatch", code="server_generation_mismatch"),
+                    status=409,
+                )
+        if "Idempotency-Key" in request.headers and not idempotency_key:
+            return web.json_response(_openai_error("Idempotency-Key must be nonempty"), status=400)
+        if len(idempotency_key) > self._MAX_IDEMPOTENCY_KEY_LENGTH:
+            return web.json_response(
+                _openai_error("Idempotency-Key exceeds maximum length"), status=400,
+            )
+
+        approval_id = body.get("approval_id")
+        if approval_id is not None and (
+            not isinstance(approval_id, str)
+            or not approval_id.strip()
+            or len(approval_id.strip()) > self._MAX_APPROVAL_ID_LENGTH
+        ):
+            return web.json_response(
+                _openai_error("approval_id must be a nonempty string within the maximum length"),
+                status=400,
+            )
+        if idempotency_key:
+            # A keyed request must name the exact approval it resolves — a
+            # fingerprint over "resolve_all" would let a retried request
+            # silently re-resolve whatever happens to be queued later.
+            if (
+                not isinstance(approval_id, str)
+                or not approval_id.strip()
+                or len(approval_id.strip()) > self._MAX_APPROVAL_ID_LENGTH
+            ):
+                return web.json_response(
+                    _openai_error("approval_id must be a nonempty string within the maximum length"),
+                    status=400,
+                )
+            approval_id = approval_id.strip()
+            if resolve_all:
+                return web.json_response(
+                    _openai_error(
+                        "Keyed approval requests cannot resolve all pending approvals",
+                        code="invalid_approval_resolution_scope",
+                    ),
+                    status=400,
+                )
+            fingerprint = self._approval_admission_fingerprint(
+                run_id, choice, resolve_all, approval_id,
+            )
+            self._sweep_approval_admissions()
+            admission = self._approval_admissions.get(idempotency_key)
+            if admission is not None:
+                if not hmac.compare_digest(str(admission["fingerprint"]), fingerprint):
+                    return web.json_response(
+                        _openai_error("Idempotency-Key was already used with different approval inputs"),
+                        status=409,
+                    )
+                return web.json_response(admission["response"], status=admission["status"])
+
+        status = self._run_statuses.get(run_id)
+        if status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        if idempotency_key:
+            current_approval = status.get("approval")
+            current_approval_id = (
+                current_approval.get("approval_id") if isinstance(current_approval, dict) else None
+            )
+            if (
+                status.get("status") != "waiting_for_approval"
+                or not hmac.compare_digest(str(current_approval_id or ""), approval_id)
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "approval_id does not match the current pending approval",
+                        code="approval_id_mismatch",
+                    ),
+                    status=409,
+                )
+
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
             return web.json_response(
@@ -7195,23 +7824,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
-            or _coerce_request_bool(body.get("resolve_all"), default=False)
-        )
+        if idempotency_key and not self._reserve_approval_admission(
+            idempotency_key, fingerprint,
+        ):
+            return web.json_response(
+                _openai_error("Approval admission registry is full", code="approval_admission_capacity"),
+                status=503,
+            )
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import resolve_gateway_approval_with_next
 
-            resolved = resolve_gateway_approval(
+            resolved, next_approval = resolve_gateway_approval_with_next(
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                approval_id=approval_id.strip() if isinstance(approval_id, str) else None,
             )
         except Exception as exc:
+            if idempotency_key:
+                self._approval_admissions.pop(idempotency_key, None)
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
             return web.json_response(_openai_error(str(exc)), status=500)
 
         if resolved <= 0:
+            if idempotency_key:
+                self._approval_admissions.pop(idempotency_key, None)
             return web.json_response(
                 _openai_error(
                     f"Run has no pending approval: {run_id}",
@@ -7220,26 +7857,75 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        response_body = {
+            "object": "hermes.run.approval_response",
+            "run_id": run_id,
+            "choice": choice,
+            "resolved": resolved,
+        }
+        next_event = None
+        if next_approval is not None:
+            try:
+                next_event = self._approval_request_event(run_id, next_approval)
+            except Exception:
+                if idempotency_key:
+                    self._approval_admissions.pop(idempotency_key, None)
+                logger.exception("[api_server] invalid remaining approval for run %s", run_id)
+                return web.json_response(_openai_error("Invalid pending approval"), status=500)
+            response_body["status"] = "waiting_for_approval"
+            response_body["approval"] = {
+                key: value for key, value in next_event.items()
+                if key not in {"event", "run_id", "timestamp"}
+            }
+        else:
+            response_body["status"] = "running"
+        if idempotency_key:
+            # Store the receipt before status/SSE publication, which can
+            # advance or clean up the active approval state.
+            self._approval_admissions[idempotency_key]["response"] = response_body
+            self._approval_admissions[idempotency_key]["status"] = 200
+
+        resolved_approval_id = approval_id.strip() if isinstance(approval_id, str) else None
+        current_approval = status.get("approval")
+        current_approval_id = (
+            current_approval.get("approval_id") if isinstance(current_approval, dict) else None
+        )
+        # A concurrent core notification may already have published a newer
+        # queue item. Only replace the displayed resolved identity.
+        can_publish_next = (
+            resolved_approval_id is None
+            or current_approval_id is None
+            or hmac.compare_digest(str(current_approval_id), resolved_approval_id)
+        )
+        if next_approval is not None and can_publish_next:
+            try:
+                self._publish_run_approval(
+                    run_id, next_approval, expected_head_id=resolved_approval_id,
+                )
+            except Exception:
+                logger.exception("[api_server] failed to republish pending approval for run %s", run_id)
+        elif next_approval is None and can_publish_next:
+            # _set_run_status merges fields, so clear the resolved approval
+            # explicitly before publishing the running state.
+            status.pop("approval", None)
+            self._set_run_status(run_id, "running", last_event="approval.responded")
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
+                response_event = {
                     "event": "approval.responded",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
-                })
+                }
+                if request_id is not None:
+                    response_event["request_id"] = request_id
+                q.put_nowait(response_event)
             except Exception:
                 pass
 
-        return web.json_response({
-            "object": "hermes.run.approval_response",
-            "run_id": run_id,
-            "choice": choice,
-            "resolved": resolved,
-        })
+        return web.json_response(response_body)
 
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""

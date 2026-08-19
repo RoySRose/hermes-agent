@@ -196,6 +196,9 @@ class GatewayStreamConsumer:
         config: Optional[StreamConsumerConfig] = None,
         metadata: Optional[dict] = None,
         on_new_message: Optional[callable] = None,
+        on_commentary_delivered: Optional[
+            Callable[[str, Optional[str]], Any]
+        ] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
@@ -212,6 +215,12 @@ class GatewayStreamConsumer:
         # the content, not edit the old bubble above it.
         # Called with no arguments. Exceptions are swallowed.
         self._on_new_message = on_new_message
+        # Fired after an interim assistant commentary message is confirmed as
+        # delivered by the platform. Receives the exact visible text and the
+        # platform message id (when the adapter returned one). Exceptions are
+        # swallowed so hook consumers cannot turn a successful send into a
+        # failed delivery.
+        self._on_commentary_delivered = on_commentary_delivered
         # Fired once when the stream transitions into its finalization path.
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
@@ -569,6 +578,22 @@ class GatewayStreamConsumer:
             flush_event.set()
         except Exception:
             pass
+
+    async def _notify_commentary_delivered(
+        self,
+        text: str,
+        message_id: Optional[str],
+    ) -> None:
+        """Fire the commentary delivery callback after a successful send."""
+        cb = self._on_commentary_delivered
+        if cb is None:
+            return
+        try:
+            result = cb(text, message_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("on_commentary_delivered callback error", exc_info=True)
 
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
@@ -1855,6 +1880,10 @@ class GatewayStreamConsumer:
                 # an interim "preview" actually carried the final response, vs.
                 # unrelated commentary delivered during a session split (#14238).
                 self._delivered_commentary_texts.append(text)
+                await self._notify_commentary_delivered(
+                    text,
+                    getattr(result, "message_id", None),
+                )
             return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)

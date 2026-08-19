@@ -133,6 +133,27 @@ def _codex_tool_call_response():
     )
 
 
+def _codex_summary_tool_call_response(summary: str):
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                summary=[SimpleNamespace(text=summary)],
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="fc_1",
+                call_id="call_1",
+                name="terminal",
+                arguments="{}",
+            ),
+        ],
+        usage=SimpleNamespace(input_tokens=12, output_tokens=4, total_tokens=16),
+        status="completed",
+        model="gpt-5-codex",
+    )
+
+
 def _codex_incomplete_message_response(text: str):
     return SimpleNamespace(
         output=[
@@ -1313,6 +1334,41 @@ def test_try_refresh_copilot_client_credentials_falls_back_when_exchange_unavail
     assert rebuilt["kwargs"]["api_key"] == "gho_raw_token"
 
 
+def test_run_conversation_emits_explicit_codex_summary_for_tool_call(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_summary_tool_call_response("Checking the repository now."),
+        _codex_message_response("done"),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(text)
+
+    result = agent.run_conversation("run a command")
+
+    assert result["completed"] is True
+    assert observed == ["Checking the repository now."]
+    tool_turn = next(
+        msg
+        for msg in result["messages"]
+        if msg.get("role") == "assistant" and msg.get("tool_calls")
+    )
+    assert tool_turn["content"] == ""
+    assert "codex_reasoning_summary" not in tool_turn
+
+
 def test_chat_messages_to_responses_input_uses_call_id_for_function_call(monkeypatch):
     agent = _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _chat_messages_to_responses_input
@@ -1777,6 +1833,178 @@ def test_interim_commentary_precedes_content_from_real_codex_normalization(monke
 
 
 
+
+
+def test_interim_tool_call_uses_explicit_codex_reasoning_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(text)
+
+    assistant_msg = {
+        "role": "assistant",
+        "content": "",
+        "reasoning": "private chain of thought",
+        "tool_calls": [{"id": "call_1"}],
+    }
+    agent._emit_interim_assistant_message(
+        assistant_msg,
+        codex_reasoning_summary="Checking the repository now.",
+    )
+
+    assert observed == ["Checking the repository now."]
+    assert assistant_msg["content"] == ""
+
+
+def test_interim_tool_call_force_redacts_codex_reasoning_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(text)
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Using token sk-abcdefghijklmnopqrstuvwxyz123456 now.",
+    )
+
+    assert len(observed) == 1
+    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in observed[0]
+    assert observed[0] != "Using token sk-abcdefghijklmnopqrstuvwxyz123456 now."
+
+
+def test_interim_tool_call_prefers_visible_content_over_codex_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(text)
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Visible progress.",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Summary fallback.",
+    )
+
+    assert observed == ["Visible progress."]
+
+
+def test_interim_tool_call_does_not_expose_raw_reasoning(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(text)
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "private chain of thought",
+            "reasoning_content": "private reasoning content",
+            "tool_calls": [{"id": "call_1"}],
+        }
+    )
+
+    assert observed == []
+
+
+def test_interim_non_codex_tool_call_does_not_expose_reasoning_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.api_mode = "chat_completions"
+    observed = []
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(text)
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "private chain of thought",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Explicit but non-Codex summary.",
+    )
+
+    assert observed == []
+
+
+def test_interim_codex_reasoning_summary_is_tagged_as_reasoning_summary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False, kind="commentary": observed.append((text, kind))
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Checking the repository now.",
+    )
+
+    assert observed == [("Checking the repository now.", "reasoning_summary")]
+
+
+def test_interim_visible_content_is_tagged_as_commentary(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False, kind="commentary": observed.append((text, kind))
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Visible progress.",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Summary fallback.",
+    )
+
+    assert observed == [("Visible progress.", "commentary")]
+
+
+def test_interim_callback_without_kind_parameter_still_receives_summary(monkeypatch):
+    """Consumers predating the kind keyword must keep working, exactly once."""
+    agent = _build_agent(monkeypatch)
+    observed = []
+
+    def legacy_callback(text, *, already_streamed=False):
+        observed.append(text)
+
+    agent.interim_assistant_callback = legacy_callback
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1"}],
+        },
+        codex_reasoning_summary="Checking the repository now.",
+    )
+
+    assert observed == ["Checking the repository now."]
+
+
+def test_interim_callback_raising_typeerror_internally_is_not_retried(monkeypatch):
+    """A TypeError from inside the callback must not re-deliver the message."""
+    agent = _build_agent(monkeypatch)
+    calls = []
+
+    def broken_callback(text, *, already_streamed=False, kind="commentary"):
+        calls.append(text)
+        raise TypeError("unsupported operand inside consumer")
+
+    agent.interim_assistant_callback = broken_callback
+
+    agent._emit_interim_assistant_message(
+        {"role": "assistant", "content": "Visible progress."}
+    )
+
+    assert calls == ["Visible progress."]
 
 
 def test_stream_delta_strips_leaked_memory_context(monkeypatch):

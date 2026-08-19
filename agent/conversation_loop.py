@@ -7187,7 +7187,12 @@ def run_conversation(
                 # still only an ephemeral in-memory projection. Emit interim
                 # commentary only after the canonical SessionDB append above.
                 if not duplicate_previous_interim:
-                    agent._emit_interim_assistant_message(assistant_msg)
+                    agent._emit_interim_assistant_message(
+                        assistant_msg,
+                        codex_reasoning_summary=getattr(
+                            assistant_message, "codex_reasoning_summary", None
+                        ),
+                    )
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may

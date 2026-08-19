@@ -13,12 +13,13 @@ Events:
   - session:reset       -- Session reset completed (new session entry created)
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
+  - agent:commentary    -- Interim assistant commentary was delivered
   - agent:end           -- Agent finishes processing
   - command:*           -- Any slash command executed (wildcard match)
 
 Errors in hooks are caught and logged but never block the main pipeline.
 
-Context dict passed to ``agent:start`` / ``agent:end`` handlers:
+Context dict passed to ``agent:start`` / ``agent:commentary`` / ``agent:end`` handlers:
   platform     -- source platform name (e.g. "telegram", "matrix", "slack")
   user_id      -- platform user id of the sender
   chat_id      -- platform chat id (group/DM identifier)
@@ -26,12 +27,17 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
                   when not in a thread / topic)
   chat_type    -- "dm" | "group" | "forum" (empty if unknown)
   session_id   -- Hermes session id
-  message      -- inbound message text (truncated to 500 chars)
+  message      -- inbound message text (full, no truncation — ecosystem patch)
 
 ``agent:end`` adds:
-  response     -- agent response text (truncated to 500 chars)
+  response     -- agent response text (full, no truncation — ecosystem patch)
   model        -- model name that handled the turn
   provider     -- provider that handled the turn
+
+``agent:commentary`` adds:
+  response          -- delivered interim assistant text (full, no truncation)
+  event_message_id  -- platform message id returned by the successful send
+                       (empty when the adapter did not return one)
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``

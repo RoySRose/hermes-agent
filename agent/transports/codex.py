@@ -739,6 +739,8 @@ class ResponsesApiTransport(ProviderTransport):
             provider_data["codex_reasoning_items"] = msg.codex_reasoning_items
         if msg and hasattr(msg, "codex_message_items") and msg.codex_message_items:
             provider_data["codex_message_items"] = msg.codex_message_items
+        if msg and getattr(msg, "codex_reasoning_summary", None):
+            provider_data["codex_reasoning_summary"] = msg.codex_reasoning_summary
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
 

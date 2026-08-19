@@ -2588,9 +2588,17 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged")
+    __slots__ = ("approval_id", "event", "data", "result", "reason", "acknowledged")
 
     def __init__(self, data: dict):
+        # Every pending approval gets a stable identity so a specific
+        # displayed prompt can be targeted later even if other approvals
+        # are queued ahead of or behind it (see resolve_gateway_approval_with_next).
+        approval_id = data.get("approval_id")
+        if not isinstance(approval_id, str) or not approval_id:
+            approval_id = uuid.uuid4().hex
+            data["approval_id"] = approval_id
+        self.approval_id = approval_id
         self.event = threading.Event()
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
@@ -2631,37 +2639,78 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
-def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False,
-                             reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
-    """Called by the gateway's /approve or /deny handler to unblock
-    waiting agent thread(s).
+def _gateway_approval_data_copy(entry: "_ApprovalEntry") -> dict:
+    """Return a shallow copy of a pending entry's approval_data.
+
+    Callers observe this outside ``_lock``, so a copy prevents them from
+    racing the approval core's own mutation of the live dict.
+    """
+    return dict(entry.data)
+
+
+def peek_gateway_approval(session_key: str) -> Optional[dict]:
+    """Return a shallow copy of the oldest pending approval, if any.
+
+    Used by API-server status polling to describe the currently displayed
+    approval (including its ``approval_id``) without consuming it.
+    """
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return None
+        return _gateway_approval_data_copy(queue[0])
+
+
+def resolve_gateway_approval_with_next(
+    session_key: str,
+    choice: str,
+    resolve_all: bool = False,
+    reason: Optional[str] = None,
+    approval_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+) -> "tuple[int, Optional[dict]]":
+    """Resolve approval(s) and atomically report the new queue head.
 
     When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    resolved at once (``/approve all``).  When *approval_id* is given, only
+    the single entry with that identity is resolved (ambiguous — i.e. not
+    found or, in principle, duplicated — identities resolve nothing so a
+    targeted decision can never silently broaden into someone else's
+    approval); it is mutually exclusive with *resolve_all*.  Otherwise only
+    the oldest pending entry is resolved (FIFO).
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+    Returns ``(resolved_count, next_approval)`` where *next_approval* is a
+    shallow copy of the new queue head (or ``None`` if the queue is now
+    empty), observed under the same lock as the removal so status responses
+    can never describe a head that already changed again.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
-            return 0
+            return 0, None
         if request_id:
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
-                return 0
+                return 0, _gateway_approval_data_copy(queue[0])
             queue[:] = [entry for entry in queue if entry not in targets]
+        elif approval_id is not None:
+            if resolve_all:
+                return 0, _gateway_approval_data_copy(queue[0])
+            matches = [entry for entry in queue if entry.approval_id == approval_id]
+            if len(matches) != 1:
+                return 0, _gateway_approval_data_copy(queue[0])
+            targets = matches
+            queue.remove(targets[0])
         elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
             targets = [queue.pop(0)]
+        next_approval = _gateway_approval_data_copy(queue[0]) if queue else None
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -2670,7 +2719,29 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if reason:
             entry.reason = reason
         entry.event.set()
-    return len(targets)
+    return len(targets), next_approval
+
+
+def resolve_gateway_approval(session_key: str, choice: str,
+                             resolve_all: bool = False,
+                             reason: Optional[str] = None,
+                             approval_id: Optional[str] = None,
+                             request_id: Optional[str] = None) -> int:
+    """Called by the gateway's /approve or /deny handler to unblock
+    waiting agent thread(s).
+
+    Thin wrapper around resolve_gateway_approval_with_next() for callers
+    that only need the resolved count. See that function for the full
+    semantics of *resolve_all*, *reason*, and *approval_id*.
+
+    Returns the number of approvals resolved (0 means nothing was pending).
+    """
+    resolved, _next_approval = resolve_gateway_approval_with_next(
+        session_key, choice,
+        resolve_all=resolve_all, reason=reason, approval_id=approval_id,
+        request_id=request_id,
+    )
+    return resolved
 
 
 def list_gateway_approvals(session_key: str) -> list[dict]:
@@ -4229,6 +4300,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             return adopted
         # Leader resolved "once" — fall through to a fresh prompt below.
 
+    # Assign identity before the entry is constructed so it is guaranteed to
+    # be present on approval_data itself (not just the entry) by the time
+    # notify_cb below hands it to the gateway/API-server surface.
+    approval_data["approval_id"] = uuid.uuid4().hex
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)

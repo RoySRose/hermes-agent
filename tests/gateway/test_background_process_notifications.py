@@ -580,36 +580,58 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     assert posts == ["raw-origin-sid"]
 
 
-def test_gateway_drain_retains_and_formats_overflow_events():
-    """watch_overflow_* events must survive the gateway drain and render
-    their summary — previously they were discarded at the drain (only
-    watch_match/watch_disabled were retained) and had no formatter branch."""
-    import asyncio
-    from gateway.run import (
-        _drain_gateway_watch_events,
-        _format_gateway_process_notification,
-    )
+# ---------------------------------------------------------------------------
+# background_process_notifications: off — profile setting is authoritative
+# ---------------------------------------------------------------------------
 
-    queue = asyncio.Queue()
-    tripped = {
-        "type": "watch_overflow_tripped",
-        "message": "watch flood detected: 47 notifications suppressed for pattern 'ERROR'",
-        "session_id": "proc_a1b2",
+
+@pytest.mark.asyncio
+async def test_off_mode_suppresses_notify_on_complete_injection(monkeypatch, tmp_path):
+    """Global off must silence agent-triggered completion turns too.
+
+    ``notify_on_complete=True`` asks the gateway to wake the agent after exit,
+    but the profile-level ``off`` setting is the operator's final authority
+    over user-facing background process notifications.
+    """
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="traceback\n", exited=True, exit_code=1, command="false",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "off")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = {
+        **_watcher_dict("proc_silent_completion"),
+        "session_key": "agent:main:telegram:dm:123",
+        "notify_on_complete": True,
     }
-    released = {
-        "type": "watch_overflow_released",
-        "message": "watch flood released: notifications resumed for pattern 'ERROR'",
-        "session_id": "proc_a1b2",
+
+    await runner._run_process_watcher(watcher)
+
+    assert adapter.send.await_count == 0
+    assert adapter.handle_message.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evt_type", ["watch_match", "watch_disabled"])
+async def test_off_mode_suppresses_watch_pattern_injection(monkeypatch, tmp_path, evt_type):
+    """Global off also silences watch-pattern and watch-disabled events."""
+    runner = _build_runner(monkeypatch, tmp_path, "off")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    evt = {
+        "type": evt_type,
+        "session_id": "proc_silent_watch",
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_id": "123",
     }
-    queue.put_nowait(tripped)
-    queue.put_nowait(released)
 
-    retained = _drain_gateway_watch_events(queue)
-    assert retained == [tripped, released]
+    await runner._inject_watch_notification("[IMPORTANT: Background process matched]", evt)
 
-    out_tripped = _format_gateway_process_notification(tripped)
-    assert "47 notifications suppressed" in out_tripped
-    assert "exit code" not in out_tripped
-    out_released = _format_gateway_process_notification(released)
-    assert "notifications resumed" in out_released
-    assert "exit code" not in out_released
+    assert adapter.handle_message.await_count == 0

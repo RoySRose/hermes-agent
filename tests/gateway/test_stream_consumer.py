@@ -1141,6 +1141,64 @@ class TestOnNewMessageCallback:
         assert consumer.already_sent is True
 
 
+class TestCommentaryDeliveryCallback:
+    @pytest.mark.asyncio
+    async def test_success_reports_visible_text_and_platform_message_id(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                message_id="commentary-msg-1",
+            )
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        on_delivered = AsyncMock()
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+            on_commentary_delivered=on_delivered,
+        )
+        consumer.on_commentary("I'll inspect it.\nMEDIA:/tmp/internal.png")
+        consumer.finish()
+
+        await consumer.run()
+
+        on_delivered.assert_awaited_once_with(
+            "I'll inspect it.",
+            "commentary-msg-1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_send_does_not_report_delivery(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(
+                success=False,
+                message_id=None,
+                error="delivery failed",
+            )
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        on_delivered = AsyncMock()
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+            on_commentary_delivered=on_delivered,
+        )
+        consumer.on_commentary("This must not produce a hook event.")
+        consumer.finish()
+
+        await consumer.run()
+
+        on_delivered.assert_not_awaited()
+
+
 class TestUtf16OverflowDetection:
     """Regression coverage for #11170 — Telegram counts message length in
     UTF-16 code units, not Python codepoints. A response with supplementary

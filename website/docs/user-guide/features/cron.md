@@ -374,6 +374,18 @@ When scheduling jobs, you specify where the output goes:
 | `"telegram,discord"` | Fan out to a specific set of channels | Comma-separated list |
 | `"origin,all"` | Deliver to the origin **plus** every other connected channel | Combine any tokens |
 
+A profile can override the implicit delivery default without changing jobs that
+name an explicit target:
+
+```yaml
+cron:
+  default_delivery: local
+```
+
+This is useful for web/UI-first profiles that should retain cron output locally
+instead of sending unattended completions back to a legacy messaging origin.
+Explicit per-job targets such as `deliver: slack` still take precedence.
+
 The agent's final response is automatically delivered to the configured `deliver:` target — the agent does not send messages itself, so there is nothing to call in the cron prompt.
 
 ### Routing intent (`all`)

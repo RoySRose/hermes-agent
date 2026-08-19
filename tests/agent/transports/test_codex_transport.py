@@ -950,6 +950,33 @@ class TestCodexNormalizeResponse:
             }
         ]
 
+    def test_explicit_reasoning_summary_preserved_in_provider_data(self, transport):
+        r = SimpleNamespace(
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    text="private chain of thought",
+                    summary=[SimpleNamespace(text="Checking the repository now.")],
+                ),
+                SimpleNamespace(
+                    type="function_call",
+                    call_id="call_abc123",
+                    name="terminal",
+                    arguments="{}",
+                    id="fc_abc123",
+                    status="completed",
+                ),
+            ],
+            status="completed",
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=10, output_tokens=20,
+                                  input_tokens_details=None, output_tokens_details=None),
+        )
+
+        nr = transport.normalize_response(r)
+
+        assert nr.codex_reasoning_summary == "Checking the repository now."
+
     def test_tool_call_response(self, transport):
         """Normalize a Codex response with tool calls."""
         r = SimpleNamespace(

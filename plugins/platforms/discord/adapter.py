@@ -166,6 +166,25 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
 )
 from tools.url_safety import is_safe_url
+from plugins.platforms.discord.file_approval import (
+    ApprovalBridgeError,
+    CHOICE_FALSE_LABEL,
+    CHOICE_TRUE_LABEL,
+    FailedUiRepair,
+    FileApprovalSettings,
+    PendingApproval,
+    ensure_compatible,
+    failed_ui_repairs,
+    get_approval,
+    pending_approvals,
+    render_message,
+    run_approval_click,
+    run_expire,
+    run_post_binding,
+    run_ui_state,
+    run_worker_wakeup,
+    validate_click_binding,
+)
 
 
 async def _read_url_image_with_redirect_guard(
@@ -1142,6 +1161,13 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         self._liveness_task: Optional[asyncio.Task] = None
         self._liveness_notification_task: Optional[asyncio.Task] = None
+        self._file_approval_settings = FileApprovalSettings.from_config(
+            self.config.extra.get("file_approval")
+            if isinstance(self.config.extra, dict)
+            else None
+        )
+        self._file_approval_task: Optional[asyncio.Task] = None
+        self._file_approval_restored_views: set[str] = set()
         # True while disconnect() is intentionally closing discord.py. The
         # bot task's done callback uses this to distinguish an operator/service
         # shutdown from a runtime websocket crash.
@@ -1395,6 +1421,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 if adapter_self._missed_message_backfill_enabled():
                     adapter_self._ensure_missed_message_backfill_task()
+                adapter_self._start_file_approval_poller()
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1469,6 +1496,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             self._running = True
             self._start_liveness_probe()
+            self._start_file_approval_poller()
             return True
 
         except asyncio.TimeoutError:
@@ -2082,6 +2110,124 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Liveness task shutdown failed", self.name, exc_info=True)
             setattr(self, task_name, None)
 
+    def _start_file_approval_poller(self) -> None:
+        settings = self._file_approval_settings
+        if not settings.ready() or not self._client:
+            return
+        if self._file_approval_task and not self._file_approval_task.done():
+            return
+        self._file_approval_task = asyncio.create_task(self._file_approval_loop())
+
+    async def _cancel_file_approval_poller(self) -> None:
+        # Tests and lightweight plugin harnesses build adapters via __new__,
+        # skipping __init__ — treat a missing task attribute as "no poller".
+        if getattr(self, "_file_approval_task", None) is None:
+            return
+        if self._file_approval_task and not self._file_approval_task.done():
+            self._file_approval_task.cancel()
+            try:
+                await self._file_approval_task
+            except asyncio.CancelledError:
+                pass
+        self._file_approval_task = None
+
+    async def _file_approval_loop(self) -> None:
+        settings = self._file_approval_settings
+        if not settings.ready():
+            return
+        while self._client and self._ready_event.is_set():
+            try:
+                await self._poll_file_approval_requests()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[%s] Discord file approval poll failed: %s", self.name, exc)
+            await asyncio.sleep(settings.poll_interval_seconds)
+
+    async def _poll_file_approval_requests(self) -> None:
+        settings = self._file_approval_settings
+        if not settings.ready():
+            return
+        ok, missing = ensure_compatible(settings)
+        if not ok:
+            logger.warning("[%s] Discord file approval DB incompatible: %s", self.name, "; ".join(missing))
+            return
+        try:
+            run_expire(settings)
+        except Exception:
+            logger.debug("[%s] Discord file approval expiry command failed", self.name, exc_info=True)
+        for req in pending_approvals(settings):
+            if req.message_id:
+                self._restore_file_approval_view(req)
+                continue
+            result = await self._send_file_approval_request(req)
+            if not result.success or not result.message_id:
+                run_ui_state(settings, req, state="send_failed", error=result.error or "send failed")
+        for repair in failed_ui_repairs(settings):
+            await self._repair_file_approval_ui(repair)
+
+    def _restore_file_approval_view(self, req: PendingApproval) -> None:
+        if not self._client or not getattr(self._client, "add_view", None):
+            return
+        if req.approval_id in self._file_approval_restored_views:
+            return
+        view = FileApprovalView(req, self._file_approval_settings)
+        try:
+            self._client.add_view(view, message_id=int(req.message_id))
+            self._file_approval_restored_views.add(req.approval_id)
+        except Exception as exc:
+            logger.debug("[%s] Failed to restore Discord approval view %s: %s", self.name, req.approval_id, exc)
+
+    async def _send_file_approval_request(self, req: PendingApproval) -> SendResult:
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        settings = self._file_approval_settings
+        try:
+            channel = self._client.get_channel(int(req.channel_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(req.channel_id))
+            view = FileApprovalView(req, settings)
+            msg = await channel.send(content=render_message(req), view=view)
+            view._message = msg
+            self._nonconversational_messages.mark_many([str(msg.id)])
+            guild_id = str(getattr(getattr(msg, "guild", None), "id", req.guild_id or "")) or req.guild_id
+            run_post_binding(
+                settings,
+                req,
+                guild_id=guild_id,
+                channel_id=req.channel_id,
+                message_id=str(msg.id),
+            )
+            view.approval = get_approval(settings, req.approval_id)
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def _repair_file_approval_ui(self, repair: FailedUiRepair) -> None:
+        if not self._client or not repair.approval.message_id:
+            return
+        try:
+            channel = self._client.get_channel(int(repair.approval.channel_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(repair.approval.channel_id))
+            message = await channel.fetch_message(int(repair.approval.message_id))
+            view = FileApprovalView(repair.approval, self._file_approval_settings)
+            for child in view.children:
+                child.disabled = True
+            suffix = "true" if repair.decision else "false"
+            await message.edit(
+                content=f"{render_message(repair.approval)}\nDecision: `{suffix}`",
+                view=view,
+            )
+            run_ui_state(self._file_approval_settings, repair.approval, state="ui_updated")
+        except Exception as exc:
+            run_ui_state(
+                self._file_approval_settings,
+                repair.approval,
+                state="ui_update_failed",
+                error=str(exc),
+            )
+
     async def cancel_background_tasks(self) -> None:
         """Cancel background tasks, but first flush any pending text-batch sends.
 
@@ -2119,6 +2265,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         task.cancel()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
+        await self._cancel_file_approval_poller()
         await super().cancel_background_tasks()
 
     def _text_batch_flush_deadline_seconds(self) -> float:
@@ -2153,6 +2300,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
+        await self._cancel_file_approval_poller()
         # Clean up all active voice connections *before* cancelling the bot task.
         # leave_voice_channel() ends in `await vc.disconnect()`, and discord.py's
         # VoiceClient.disconnect() sends a voice state update over the main
@@ -2199,6 +2347,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._post_connect_task = None
         self._liveness_task = None
         self._missed_message_backfill_task = None
+        self._file_approval_task = None
+        getattr(self, "_file_approval_restored_views", set()).clear()
 
         self._release_platform_lock()
 
@@ -8775,7 +8925,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, FileApprovalView, ClarifyChoiceView, ChoicePickerView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -9479,6 +9629,119 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+
+    class FileApprovalView(discord.ui.View):
+        """Persistent DB-backed approval prompt for synthetic-media decisions."""
+
+        def __init__(self, approval: PendingApproval, settings: FileApprovalSettings):
+            super().__init__(timeout=None)
+            self.approval = approval
+            self.settings = settings
+
+            false_btn = discord.ui.Button(
+                label=CHOICE_FALSE_LABEL,
+                style=discord.ButtonStyle.success,
+                custom_id=approval.custom_id_false,
+            )
+            false_btn.callback = self._make_callback(False)
+            self.add_item(false_btn)
+
+            true_btn = discord.ui.Button(
+                label=CHOICE_TRUE_LABEL,
+                style=discord.ButtonStyle.danger,
+                custom_id=approval.custom_id_true,
+            )
+            true_btn.callback = self._make_callback(True)
+            self.add_item(true_btn)
+
+        def _make_callback(self, value: bool):
+            async def _callback(interaction: "discord.Interaction"):
+                await self._decide(interaction, value)
+            return _callback
+
+        async def _decide(self, interaction: "discord.Interaction", value: bool) -> None:
+            user = getattr(interaction, "user", None)
+            user_id = str(getattr(user, "id", "") or "")
+            if user_id not in self.settings.approver_user_ids:
+                await interaction.response.send_message(
+                    "You're not authorized to answer this approval~", ephemeral=True,
+                )
+                return
+
+            message = getattr(interaction, "message", None)
+            custom_id = str(getattr(interaction, "data", {}).get("custom_id") or "")
+            interaction_id = str(getattr(interaction, "id", "") or "")
+            guild_id = str(getattr(interaction, "guild_id", "") or "") or None
+            channel_id = str(
+                getattr(interaction, "channel_id", "")
+                or getattr(getattr(message, "channel", None), "id", "")
+                or self.approval.channel_id
+            )
+            message_id = str(getattr(message, "id", "") or self.approval.message_id or "")
+
+            try:
+                self.approval = await asyncio.to_thread(
+                    get_approval,
+                    self.settings,
+                    self.approval.approval_id,
+                )
+                validate_click_binding(
+                    self.approval,
+                    custom_id=custom_id,
+                    decision=value,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                )
+                result = await asyncio.to_thread(
+                    run_approval_click,
+                    self.settings,
+                    self.approval,
+                    decision=value,
+                    user_id=user_id,
+                    interaction_id=interaction_id,
+                    custom_id=custom_id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                )
+            except ApprovalBridgeError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+
+            for child in self.children:
+                child.disabled = True
+
+            suffix = "true" if value else "false"
+            try:
+                await interaction.response.edit_message(
+                    content=f"{render_message(self.approval)}\nDecision: `{suffix}`",
+                    view=self,
+                )
+                await asyncio.to_thread(run_ui_state, self.settings, self.approval, state="ui_updated")
+            except Exception as exc:
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        run_ui_state,
+                        self.settings,
+                        self.approval,
+                        state="ui_update_failed",
+                        error=str(exc),
+                    )
+                try:
+                    await interaction.response.send_message(
+                        f"Approval recorded: {suffix}", ephemeral=True,
+                    )
+                except Exception:
+                    pass
+
+            if not result.idempotent:
+                try:
+                    await asyncio.to_thread(run_worker_wakeup, self.settings, result)
+                except Exception as exc:
+                    logger.warning("Discord file approval wakeup failed: %s", exc)
+
 
 
     class ChoicePickerView(discord.ui.View):
@@ -10497,6 +10760,9 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key and not os.getenv(env_key):
                 os.environ[env_key] = str(value)
+    file_approval_cfg = discord_cfg.get("file_approval")
+    if isinstance(file_approval_cfg, dict):
+        seeded_extra["file_approval"] = file_approval_cfg
     return seeded_extra or None
 
 

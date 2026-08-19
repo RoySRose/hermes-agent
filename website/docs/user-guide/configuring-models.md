@@ -126,6 +126,19 @@ model:
   api_mode: chat_completions
 ```
 
+**Per-platform gateway defaults (optional):**
+```yaml
+platforms:
+  slack:
+    model: gpt-5.6-terra
+    reasoning_effort: medium
+```
+
+These values affect only gateway sessions created from that platform. An
+explicit `/model` or `/reasoning` command in a chat still takes precedence.
+Platforms without an override continue to use the profile-wide `model` and
+`agent.reasoning_effort` settings.
+
 **Auxiliary override (example — vision on gemini-flash):**
 ```yaml
 auxiliary:
