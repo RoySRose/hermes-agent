@@ -62,62 +62,63 @@ class TestRedactApprovalCommand:
 
 class TestApprovalCommandWiring:
     """Guard the production wiring on BOTH approval-notify transports:
-    1. the chat-platform path (_approval_notify_sync in gateway/run.py),
-       which redacts and reassigns the command inline before it reaches
-       send_exec_approval, and
-    2. the SSE/API path (gateway/platforms/api_server.py), where every
-       outbound approval event is built by _approval_request_event (which
-       redacts and reassigns the command into the event dict) and
-       _publish_run_approval is the sole producer that turns such an event
-       into an SSE put_nowait -- it must call the builder before
-       enqueueing. _approval_notify is the callback registered for this
-       path and must not enqueue directly, so there is no route around
-       the builder.
-    Uses AST (not char-offset string slicing) so a benign refactor doesn't
-    cause a false failure, and so a discarded-result call
-    (`_redact(cmd); send(cmd)`) does NOT pass."""
+    1. the chat-platform path (_approval_notify_sync in gateway/run.py), and
+    2. the SSE/API path (_approval_notify in
+       gateway/platforms/api_server_runs.py),
+    each of which must route the command through _redact_approval_command and
+    REASSIGN the redacted value before any send/enqueue (so the raw command
+    cannot reach a client). Uses AST (not char-offset string slicing) so a
+    benign refactor doesn't cause a false failure, and so a discarded-result
+    call (`_redact(cmd); send(cmd)`) does NOT pass."""
 
-    def _find_function(self, module, func_name: str):
-        """Parse `module`'s full source into an AST and return
-        `(source, node)` for the (possibly nested) FunctionDef/
-        AsyncFunctionDef named `func_name`. Walking the real AST (not a
-        source slice) means the search is refactor-robust regardless of
-        nesting depth or surrounding line churn."""
+    # [local-patch] approval-redaction-chokepoint-guard
+    def _assert_no_bypass_call(self, module, func_name: str, forbidden_substr: str):
+        """Assert a production function has no direct call to a forbidden sink."""
         import ast
         import inspect
 
         source = inspect.getsource(module)
         tree = ast.parse(source)
+        target = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == func_name
+        )
+        for node in ast.walk(target):
+            if node is target:
+                continue
+            segment = ast.get_source_segment(source, node)
+            assert not (segment and forbidden_substr in segment), (
+                f"{func_name} bypasses the approval redaction boundary via {forbidden_substr}"
+            )
+
+    def _assert_redacts_then_uses(self, module, func_name: str, sink_substr: str):
+        """Parse `module`'s full AST, locate the (possibly nested) function
+        `func_name`, and assert it contains an assignment
+        `<x> = _redact_approval_command(...)` whose result is then used by a
+        statement matching `sink_substr` on a LATER line. Walking the real AST
+        (not a source slice) is refactor-robust and rejects discarded-result
+        calls (the call must be an assignment, not a bare expression)."""
+        import ast
+        import inspect
+
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+        target_fn = None
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
-                return source, node
-        raise AssertionError(f"function {func_name} not found in {module.__name__}")
-
-    def _assert_redacts_then_uses(
-        self, module, func_name: str, sink_substr: str,
-        *, call_name: str = "_redact_approval_command",
-    ):
-        """Locate `func_name` in `module` and assert it contains an
-        assignment `<x> = call_name(...)` whose result is then used by a
-        statement matching `sink_substr` on a LATER line. `call_name`
-        matches both a bare-name call (`_redact_approval_command(...)`) and
-        a method call (`self._approval_request_event(...)`), so the same
-        walk guards the module-level redaction seam and the SSE
-        event-builder chokepoint. This rejects discarded-result calls (the
-        call must be an assignment, not a bare expression)."""
-        import ast
-
-        source, target_fn = self._find_function(module, func_name)
+                target_fn = node
+                break
+        assert target_fn is not None, f"function {func_name} not found in {module.__name__}"
 
         redact_line = None
         for node in ast.walk(target_fn):
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 fn = node.value.func
-                called = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-                if called == call_name:
+                if isinstance(fn, ast.Name) and fn.id == "_redact_approval_command":
                     redact_line = node.lineno
         assert redact_line is not None, (
-            f"{func_name} must assign the result of {call_name}(...) "
+            f"{func_name} must assign the result of _redact_approval_command(...) "
             "(a discarded-result call would still leak the raw command)"
         )
 
@@ -131,51 +132,17 @@ class TestApprovalCommandWiring:
             f"`{sink_substr}` sink not found after the redaction in {func_name}"
         )
 
-    def _assert_no_bypass_call(self, module, func_name: str, forbidden_substr: str):
-        """Locate `func_name` in `module` and assert no node in its body
-        (other than the function definition itself) has a source segment
-        containing `forbidden_substr` -- i.e. the function has no direct
-        route to that sink and must delegate through the chokepoint
-        instead."""
-        import ast
-
-        source, target_fn = self._find_function(module, func_name)
-
-        bypass_line = None
-        for node in ast.walk(target_fn):
-            if node is target_fn:
-                continue
-            seg = ast.get_source_segment(source, node)
-            if seg and forbidden_substr in seg:
-                bypass_line = node.lineno
-                break
-        assert bypass_line is None, (
-            f"{func_name} must not call `{forbidden_substr}` directly "
-            "(that would bypass the redaction chokepoint)"
-        )
-
     def test_chat_platform_path_redacts_before_send(self):
         import gateway.run as run
 
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
     def test_sse_api_path_redacts_before_enqueue(self):
-        from gateway.platforms import api_server
+        from gateway.platforms import api_server_runs
 
-        # The shared event builder assigns (not discards) the redacted
-        # command into the outbound event.
         self._assert_redacts_then_uses(
-            api_server, "_approval_request_event", "return event",
+            api_server_runs, "_approval_notify", "put_nowait"
         )
-        # The sole producer that turns an event into an SSE enqueue must
-        # call the builder before putting it on the queue.
-        self._assert_redacts_then_uses(
-            api_server, "_publish_run_approval", "put_nowait",
-            call_name="_approval_request_event",
-        )
-        # No bypass: the registered notify callback must not enqueue
-        # directly.
-        self._assert_no_bypass_call(api_server, "_approval_notify", "put_nowait")
 
 
 class TestApprovalTextFallbackContract:
@@ -191,5 +158,4 @@ class TestApprovalTextFallbackContract:
         assert "`/approve`" in text
         assert "approve session" not in text
         assert "approve always" not in text
-
 

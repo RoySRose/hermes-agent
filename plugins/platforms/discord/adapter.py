@@ -1504,6 +1504,8 @@ class DiscordAdapter(BasePlatformAdapter):
             self._running = True
             self._start_liveness_probe()
             self._start_file_approval_poller()
+            # Plugin-registered native handlers (discord.py Bot).
+            self._wire_plugin_handlers(self._client)
             return True
 
         except asyncio.TimeoutError:
