@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -381,6 +382,58 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    # [local-patch] run-interim-assistant-events
+    @pytest.mark.asyncio
+    async def test_events_stream_emits_completed_interim_messages(self, adapter):
+        """중간 진행 코멘터리가 assistant.interim.completed 로 스트림에 노출된다.
+
+        hive-api outbox 소비 계약: event/run_id/event_id(f"{run_id}:interim:{n}")/
+        content — think 블록은 제거되고 빈 내용은 발신되지 않는다."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            def create_agent(**kwargs):
+                callback = kwargs["interim_assistant_callback"]
+                agent = MagicMock()
+                agent._strip_think_blocks.side_effect = lambda text: text.replace(
+                    "<think>private</think>", ""
+                )
+                agent._last_content_with_tools = None
+                agent._last_content_tools_all_housekeeping = False
+
+                def run_conversation(**_run_kwargs):
+                    callback("<think>private</think>실제 중간 진행", already_streamed=True)
+                    callback("두 번째 진행", kind="commentary")
+                    callback("<think>private</think>")
+                    return {"final_response": "최종 답변"}
+
+                agent.run_conversation.side_effect = run_conversation
+                agent.session_prompt_tokens = 10
+                agent.session_completion_tokens = 5
+                agent.session_total_tokens = 15
+                return agent
+
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        interim = [
+            event for event in events
+            if event.get("event") == "assistant.interim.completed"
+        ]
+        assert [event["content"] for event in interim] == ["실제 중간 진행", "두 번째 진행"]
+        assert [event["event_id"] for event in interim] == [
+            f"{run_id}:interim:0",
+            f"{run_id}:interim:1",
+        ]
+        assert all(event["run_id"] == run_id for event in interim)
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):

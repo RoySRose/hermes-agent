@@ -620,6 +620,8 @@ async def _handle_runs(
     self._run_approval_sessions[run_id] = approval_session_key
 
     event_cb = self._make_run_event_callback(run_id, loop)
+    interim_sequence = 0
+    agent_ref: List[Any] = [None]
 
     def _put_event_if_active(event: Optional[Dict]) -> None:
         """Enqueue only while this run still owns live transport state."""
@@ -639,6 +641,56 @@ async def _handle_runs(
                 "timestamp": time.time(),
                 "delta": delta,
             })
+        except Exception:
+            pass
+
+    # [local-patch] run-interim-assistant-events
+    def _interim_assistant_cb(
+        text: str,
+        *,
+        already_streamed: bool = False,
+        kind: str = "commentary",
+    ) -> None:
+        """Expose only completed, visible interim assistant messages."""
+        nonlocal interim_sequence
+        agent = agent_ref[0]
+        if agent is None:
+            return
+        try:
+            visible = agent._strip_think_blocks(text or "").strip()
+        except Exception:
+            visible = str(text or "").strip()
+        if not visible:
+            return
+
+        # A content+housekeeping-tools turn may become the final answer when
+        # its follow-up is empty. Keep that candidate exclusively in
+        # run.completed instead of leaking it as interim commentary.
+        try:
+            last_content = agent._strip_think_blocks(
+                getattr(agent, "_last_content_with_tools", "") or ""
+            ).strip()
+        except Exception:
+            last_content = str(getattr(agent, "_last_content_with_tools", "") or "").strip()
+        if (
+            getattr(agent, "_last_content_tools_all_housekeeping", False)
+            and visible == last_content
+        ):
+            return
+
+        event_id = f"{run_id}:interim:{interim_sequence}"
+        interim_sequence += 1
+        event = {
+            "event": "assistant.interim.completed",
+            "run_id": run_id,
+            "event_id": event_id,
+            "timestamp": time.time(),
+            "content": visible,
+            "kind": kind,
+        }
+        self._set_run_status(run_id, "running", last_event=event["event"])
+        try:
+            loop.call_soon_threadsafe(_put_event_if_active, event)
         except Exception:
             pass
 
@@ -721,6 +773,7 @@ async def _handle_runs(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
+                    interim_assistant_callback=_interim_assistant_cb,
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
                     requested_model=agent_overrides.get("requested_model"),
@@ -730,6 +783,7 @@ async def _handle_runs(
                     room_dispatch=room_dispatch,
                     room_execution_policy=room_execution_policy,
                 )
+            agent_ref[0] = agent
             self._active_run_agents[run_id] = agent
 
             def _approval_notify(approval_data: Dict[str, Any]) -> None:
