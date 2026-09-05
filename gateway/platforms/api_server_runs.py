@@ -1459,6 +1459,25 @@ async def _handle_stop_run(
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
 
+    # [local-patch] run-stop-interrupts-owned-delegations
+    # API runs bind tools.approval's current session key to run_id before the
+    # agent loop starts. Async delegations capture that same key at dispatch,
+    # so this stops only children commissioned by the target run and leaves
+    # concurrent runs/channels in this gateway process untouched.
+    try:
+        from tools.async_delegation import interrupt_for_session
+
+        delegations_interrupted = interrupt_for_session(
+            session_key=run_id,
+            reason="api_server_run_stop",
+        )
+    except Exception:
+        logger.exception(
+            "[api_server] failed to interrupt async delegations for run %s",
+            run_id,
+        )
+        delegations_interrupted = 0
+
     if agent is not None:
         try:
             request_hard_interrupt(agent, "Stop requested via API")
@@ -1473,7 +1492,11 @@ async def _handle_stop_run(
             agent, source="api_server_run_stop"
         )
 
-    return web.json_response({"run_id": run_id, "status": "stopping"})
+    return web.json_response({
+        "run_id": run_id,
+        "status": "stopping",
+        "delegations_interrupted": delegations_interrupted,
+    })
 
 
 async def _sweep_orphaned_runs(self) -> None:

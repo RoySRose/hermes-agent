@@ -912,6 +912,18 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
+    # [local-patch] run-stop-owned-delegation-status
+    # An interrupt can surface from the child runner as a provider/tool error.
+    # Preserve the operator-requested lifecycle outcome instead of recording
+    # an owned stop as an unrelated delegation failure.
+    interrupt_reason = event_record.get("_interrupt_reason")
+    if interrupt_reason:
+        result = dict(result)
+        result["status"] = "interrupted"
+        result["exit_reason"] = "interrupted"
+        result.setdefault("error", f"Interrupted: {interrupt_reason}")
+        status = "interrupted"
+
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
@@ -1161,6 +1173,14 @@ def _finalize_batch(
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
+
+    interrupt_reason = event_record.get("_interrupt_reason")
+    if interrupt_reason:
+        combined = dict(combined)
+        combined["status"] = "interrupted"
+        combined["exit_reason"] = "interrupted"
+        combined.setdefault("error", f"Interrupted: {interrupt_reason}")
+        status = "interrupted"
 
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
@@ -1519,7 +1539,10 @@ def interrupt_all(reason: str = "shutdown") -> int:
         targets = [
             r for r in _records.values()
             if r.get("status") in ("running", "stalling")
+            and callable(r.get("interrupt_fn"))
         ]
+        for r in targets:
+            r["_interrupt_reason"] = reason
     for r in targets:
         fn = r.get("interrupt_fn")
         if callable(fn):
@@ -1527,6 +1550,9 @@ def interrupt_all(reason: str = "shutdown") -> int:
                 fn()
                 count += 1
             except Exception as exc:
+                with _records_lock:
+                    if r.get("status") in ("running", "stalling"):
+                        r.pop("_interrupt_reason", None)
                 logger.debug(
                     "interrupt_all: %s interrupt failed: %s",
                     r.get("delegation_id"), exc,
@@ -1567,6 +1593,7 @@ def interrupt_for_session(
         targets = [
             r for r in _records.values()
             if r.get("status") in ("running", "stalling")
+            and callable(r.get("interrupt_fn"))
             and _matches_session_selectors(
                 r,
                 session_key=session_key,
@@ -1574,6 +1601,8 @@ def interrupt_for_session(
                 parent_session_id=parent_session_id,
             )
         ]
+        for r in targets:
+            r["_interrupt_reason"] = reason
     for r in targets:
         fn = r.get("interrupt_fn")
         if callable(fn):
@@ -1581,6 +1610,9 @@ def interrupt_for_session(
                 fn()
                 count += 1
             except Exception as exc:
+                with _records_lock:
+                    if r.get("status") in ("running", "stalling"):
+                        r.pop("_interrupt_reason", None)
                 logger.debug(
                     "interrupt_for_session: %s interrupt failed: %s",
                     r.get("delegation_id"), exc,

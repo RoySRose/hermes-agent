@@ -819,6 +819,7 @@ class TestStopRun:
                 stop_data = await stop_resp.json()
                 assert stop_data["run_id"] == run_id
                 assert stop_data["status"] == "stopping"
+                assert stop_data["delegations_interrupted"] == 0
 
                 # Agent interrupt should have been called
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
@@ -832,6 +833,50 @@ class TestStopRun:
                 await asyncio.sleep(0.2)
                 assert run_id not in adapter._active_run_agents
                 assert run_id not in adapter._active_run_tasks
+
+    @pytest.mark.asyncio
+    async def test_stop_interrupts_only_async_delegations_owned_by_run(self, adapter):
+        """Stopping one API run must not cancel another run's async children."""
+        from tools import async_delegation
+
+        app = _create_runs_app(adapter)
+        target_interrupted = threading.Event()
+        other_interrupted = threading.Event()
+        target_id = "deleg_stop_target"
+        other_id = "deleg_stop_other"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                with async_delegation._records_lock:
+                    async_delegation._records[target_id] = {
+                        "delegation_id": target_id,
+                        "session_key": run_id,
+                        "status": "running",
+                        "interrupt_fn": target_interrupted.set,
+                    }
+                    async_delegation._records[other_id] = {
+                        "delegation_id": other_id,
+                        "session_key": "run_other_session",
+                        "status": "running",
+                        "interrupt_fn": other_interrupted.set,
+                    }
+                try:
+                    stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                    stop_data = await stop_resp.json()
+                    assert stop_resp.status == 200
+                    assert stop_data["delegations_interrupted"] == 1
+                    assert target_interrupted.wait(timeout=1.0)
+                    assert not other_interrupted.is_set()
+                finally:
+                    with async_delegation._records_lock:
+                        async_delegation._records.pop(target_id, None)
+                        async_delegation._records.pop(other_id, None)
 
 
     @pytest.mark.asyncio

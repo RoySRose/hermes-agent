@@ -317,6 +317,33 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_interrupt_for_session_overrides_batch_error_status():
+    """An owned stop remains interrupted even if the child unwinds as an error."""
+    released = threading.Event()
+
+    def runner():
+        released.wait(timeout=60)
+        raise RuntimeError("provider call interrupted")
+
+    def interrupt_fn():
+        released.set()
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["long owned task"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="run_owned", runner=runner,
+        interrupt_fn=interrupt_fn, max_async_children=3,
+    )
+    assert ad.interrupt_for_session(
+        session_key="run_owned", reason="api_server_run_stop",
+    ) == 1
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "interrupted"
+    records = ad.list_async_delegations()
+    matching = [r for r in records if r["delegation_id"] == dispatched["delegation_id"]]
+    assert matching[0]["status"] == "interrupted"
+
+
 def _fast_stale_monitor(monkeypatch, *, idle=0.15, in_tool=0.3, grace=0.15):
     """Shrink the stale-monitor cadence so tests run in milliseconds."""
     monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
