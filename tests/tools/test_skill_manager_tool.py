@@ -1344,3 +1344,47 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+# ---------------------------------------------------------------------------
+# Symlinked skill directories
+# ---------------------------------------------------------------------------
+
+
+class TestSymlinkedSkillDiscovery:
+    """Skill directories are frequently symlinks into a separate repository
+    that holds the authored skill. Lookup must follow those links —
+    ``Path.rglob`` does not descend into symlinked directories, so a
+    ``rglob``-based scan finds the skill at load time (that walker follows
+    links) but not at edit time."""
+
+    def _linked_skill(self, tmp_path, name):
+        target = tmp_path / "external" / name
+        target.mkdir(parents=True)
+        (target / "SKILL.md").write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+        skills = tmp_path / "skills"
+        skills.mkdir(exist_ok=True)
+        (skills / name).symlink_to(target, target_is_directory=True)
+        return skills, target
+
+    def test_find_skill_follows_symlinked_skill_dir(self, tmp_path):
+        from tools.skill_manager_tool import _find_skill
+
+        skills, _target = self._linked_skill(tmp_path, "linked-skill")
+        with _skill_dir(skills):
+            found = _find_skill("linked-skill")
+
+        assert found is not None, "symlinked skill dir must be discoverable"
+        assert (found["path"] / "SKILL.md").read_text() == VALID_SKILL_CONTENT
+
+    def test_patch_edits_the_skill_behind_the_symlink(self, tmp_path):
+        skills, target = self._linked_skill(tmp_path, "linked-skill")
+        with _skill_dir(skills):
+            result = _patch_skill(
+                "linked-skill",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the other thing.",
+            )
+
+        assert result["success"] is True, result
+        assert "Do the other thing." in (target / "SKILL.md").read_text()

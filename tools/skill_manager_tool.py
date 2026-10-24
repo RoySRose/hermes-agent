@@ -208,9 +208,12 @@ def _resolve_skill_dir(name: str, category: str | None = None) -> Path:
     return base / (category or "") / name
 
 
-def _iter_skill_dirs(root: Path):
-    from agent.skill_utils import is_excluded_skill_path
-    for skill_md in root.rglob("SKILL.md"):
+def _iter_skill_dirs(skills_dir: Path):
+    """Skill dirs under *skills_dir*, walked like the loader does (``os.walk(followlinks=True)``):
+    ``Path.rglob`` does not descend into symlinked dirs, so a skill stocked as a symlink into another
+    repository would load but be un-editable by name (and invisible to the cross-profile hint)."""
+    from agent.skill_utils import is_excluded_skill_path, iter_skill_index_files
+    for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
         if not is_excluded_skill_path(skill_md):
             yield skill_md.parent
 

@@ -151,6 +151,32 @@ class TestSkillManageCrossProfileErrorUX:
         assert "not found in active profile 'hermes-security'" in err
         assert "skills_list" in err
 
+
+class TestSkillManageCrossProfileSymlinkedSkill:
+    def test_error_names_other_profile_when_skill_is_symlinked_there(
+        self, fake_hermes, monkeypatch
+    ):
+        """Profiles commonly stock their skills as symlinks into a separate
+        repository. The cross-profile hint must see through the link, or the
+        error degrades to the generic 'use skills_list()' form."""
+        external = fake_hermes["root"] / "external" / "linked-only-skill"
+        external.mkdir(parents=True)
+        (external / "SKILL.md").write_text(
+            "---\nname: linked-only-skill\ndescription: a skill.\n---\n"
+        )
+        link = fake_hermes["coder_home"] / "skills" / "linked-only-skill"
+        link.symlink_to(external, target_is_directory=True)
+
+        import importlib
+        import tools.skill_manager_tool
+        importlib.reload(tools.skill_manager_tool)
+        from tools.skill_manager_tool import _skill_not_found_error
+
+        err = _skill_not_found_error("linked-only-skill")
+        assert "coder" in err, err
+        assert "hermes -p" in err or "cross_profile=True" in err
+
+
 # ---------------------------------------------------------------------------
 # System prompt active-profile line (item B)
 # ---------------------------------------------------------------------------
